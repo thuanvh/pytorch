@@ -9,18 +9,17 @@ from torch.nn.functional import binary_cross_entropy_with_logits
 
 class Geometric(Distribution):
     r"""
-    Creates a Geometric distribution parameterized by `probs`, where `probs` is the probability of success of Bernoulli
-    trials. It represents the probability that in k + 1 Bernoulli trials, the first k trials failed, before
-    seeing a success.
+    Creates a Geometric distribution parameterized by :attr:`probs`, where :attr:`probs` is the probability of
+    success of Bernoulli trials. It represents the probability that in :math:`k + 1` Bernoulli trials, the
+    first :math:`k` trials failed, before seeing a success.
 
-    Samples are non-negative integers [0, inf).
+    Samples are non-negative integers [0, :math:`\inf`).
 
     Example::
 
         >>> m = Geometric(torch.tensor([0.3]))
         >>> m.sample()  # underlying Bernoulli has 30% chance 1; 70% chance 0
-         2
-        [torch.FloatTensor of size 1]
+        tensor([ 2.])
 
     Args:
         probs (Number, Tensor): the probabilty of sampling `1`. Must be in range (0, 1]
@@ -75,4 +74,4 @@ class Geometric(Distribution):
         return value * (-probs).log1p() + self.probs.log()
 
     def entropy(self):
-        return binary_cross_entropy_with_logits(self.logits, self.probs, reduce=False) / self.probs
+        return binary_cross_entropy_with_logits(self.logits, self.probs, reduction='none') / self.probs

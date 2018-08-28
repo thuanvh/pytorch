@@ -26,7 +26,7 @@
 
 namespace caffe2 {
 
-class DAGNetBase : public NetBase {
+class CAFFE2_API DAGNetBase : public NetBase {
  public:
   DAGNetBase(const std::shared_ptr<const NetDef>& net_def, Workspace* ws);
   ~DAGNetBase() override;
@@ -36,10 +36,6 @@ class DAGNetBase : public NetBase {
   // notifies all its children, and for any children that is ready, enqueues
   // it to the job queue.
   void WorkerFunction();
-  vector<float> TEST_Benchmark(
-      const int warmup_runs,
-      const int main_runs,
-      const bool run_individual) override;
 
   const dag_utils::ExecutionChains& TEST_execution_chains() const {
     return execution_chains_;
@@ -88,10 +84,10 @@ class DAGNetBase : public NetBase {
   mutable std::vector<DAGNetStats> stats_;
   std::unordered_map<int, std::unique_ptr<Timer>> task_timers_;
 
-  DISABLE_COPY_AND_ASSIGN(DAGNetBase);
+  AT_DISABLE_COPY_AND_ASSIGN(DAGNetBase);
 };
 
-class DAGNet : public DAGNetBase {
+class CAFFE2_API DAGNet : public DAGNetBase {
  public:
   using DAGNetBase::DAGNetBase;
 

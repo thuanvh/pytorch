@@ -1,4 +1,4 @@
-## @package optimizer
+# @package optimizer
 # Module caffe2.python.optimizer
 from __future__ import absolute_import
 from __future__ import division
@@ -10,12 +10,11 @@ from past.builtins import basestring
 
 import numpy as np
 
-from caffe2.python import core, scope, workspace
+from caffe2.python import core, scope, utils, workspace
 from caffe2.python.modeling import parameter_info
 from caffe2.proto import caffe2_pb2
 
 
-_OPTIMIZER_ITERATION_NAME = "optimizer_iteration"
 _LEARNING_RATE_INJECTION = "lr_injection"
 
 AuxOptimizerParams = namedtuple("AuxOptimizerParams", ["local", "shared"])
@@ -28,7 +27,8 @@ class Optimizer(object):
         self._instance_num = _optimizer_instance_count[self.__class__.__name__]
         _optimizer_instance_count[self.__class__.__name__] += 1
         self._lr_multiplier = None
-        self._lr_multiplier_on_gpu = False
+        self._local_lr_multiplier = None
+        self._local_lr_multiplier_on_gpu = False
 
     '''
     Adds optimization operators to the net for given parameter and its gradient
@@ -88,20 +88,11 @@ class Optimizer(object):
         if learning_rate_blob is None:
             learning_rate_blob = self.make_unique_blob_name('lr')
 
-        optimization_iter_blob = _OPTIMIZER_ITERATION_NAME
-        if not param_init_net.BlobIsDefined(optimization_iter_blob):
-            # Add training operators.
-            with core.DeviceScope(core.DeviceOption(caffe2_pb2.CPU)):
-                iteration = param_init_net.ConstantFill(
-                    [], optimization_iter_blob, shape=[1],
-                    value=iter_val,
-                    dtype=core.DataType.INT64)
-                iter_mutex = param_init_net.CreateMutex(
-                    [], ["iteration_mutex"]
-                )
-                net.AtomicIter([iter_mutex, iteration], [iteration])
-        else:
-            iteration = param_init_net.GetBlobRef(optimization_iter_blob)
+        iteration = utils.BuildUniqueMutexIter(
+            param_init_net,
+            net,
+            iter_val=iter_val
+        )
 
         if not net.BlobIsDefined(learning_rate_blob):
             # There is one interesting thing here: since we are minimizing, we are
@@ -117,29 +108,59 @@ class Optimizer(object):
             lr = net.GetBlobRef(learning_rate_blob)
 
         if self._lr_multiplier is not None:
-            current_scope = scope.CurrentDeviceScope()
-            if (current_scope is not None
-                    and current_scope.device_type == caffe2_pb2.CUDA
-                    and not self._lr_multiplier_on_gpu):
-                lr_multiplier = net.CopyFromCPUInput(
-                    self._lr_multiplier,
-                    self.make_unique_blob_name('lr_multiplier')
-                )
-            else:
-                lr_multiplier = self._lr_multiplier
+            lr_multiplier = net.CopyFromCPUInput(
+                self._lr_multiplier, self.make_unique_blob_name('lr_multiplier')
+            )
 
-            scaled_lr = net.Mul(
+            lr = net.Mul(
                 [lr, lr_multiplier],
                 self.make_unique_blob_name('scaled_lr'),
                 broadcast=1,
             )
-            lr = scaled_lr
+
+        if self._local_lr_multiplier is not None:
+            current_scope = scope.CurrentDeviceScope()
+            if (current_scope is not None
+                    and current_scope.device_type == caffe2_pb2.CUDA
+                    and not self._local_lr_multiplier_on_gpu):
+                local_lr_multiplier = net.CopyFromCPUInput(
+                    self._local_lr_multiplier,
+                    self.make_unique_blob_name('local_lr_multiplier')
+                )
+            else:
+                local_lr_multiplier = self._local_lr_multiplier
+
+            lr = net.Mul(
+                [lr, local_lr_multiplier],
+                self.make_unique_blob_name('local_scaled_lr'),
+                broadcast=1,
+            )
 
         return lr, iteration
 
-    def add_lr_multiplier(self, lr_multiplier, is_gpu_blob=False):
+    def add_lr_multiplier(self, lr_multiplier):
+        """
+        Set the global learning rate multiplier. If a multiplier already
+        existed, this will overwrite the existing multiplier. The multiplier is
+        used for all future calls to _run(), unless it is overwritten.
+        """
         self._lr_multiplier = lr_multiplier
-        self._lr_multiplier_on_gpu = is_gpu_blob
+
+    def _add_local_lr_multiplier(self, local_lr_multiplier, is_gpu_blob=False):
+        """
+        Set the local learning rate multiplier. This local multiplier is
+        multiplied with the global learning rate multiplier if it exists. As
+        with the global learning rate multiplier, this multiplier will be
+        used for all future calls to _run(), so please call
+        _clear_local_lr_multiplier() at the beginning of the optimizer's _run()
+        before optionally calling this function.
+        """
+        self._local_lr_multiplier = local_lr_multiplier
+        self._local_lr_multiplier_on_gpu = is_gpu_blob
+
+    def _clear_local_lr_multiplier(self):
+        self._local_lr_multiplier = None
+        self._local_lr_multiplier_on_gpu = False
 
     @staticmethod
     def dedup(net, sparse_dedup_aggregator, grad):
@@ -183,6 +204,14 @@ class Optimizer(object):
         raise NotImplementedError(
             "Optimizer Need to Implement `scale_learning_rate` method.")
 
+    def create_lars_inputs(self, param_init_net, weight_decay, trust, lr_max):
+        wd = param_init_net.ConstantFill([], "weight_decay",
+            shape=[1], value=weight_decay)
+        trust = param_init_net.ConstantFill([], "trust", shape=[1], value=trust)
+        lr_max = param_init_net.ConstantFill([], "lr_max", shape=[1],
+            value=lr_max)
+        return wd, trust, lr_max
+
 
 class SgdOptimizer(Optimizer):
     def __init__(self, base_learning_rate=0.01, policy='fixed',
@@ -206,16 +235,21 @@ class SgdOptimizer(Optimizer):
             "Expect positive base learning rate, got {}".format(
                 self.base_learning_rate))
 
+        self._clear_local_lr_multiplier()
+
         # TODO(zqq): support LARS for sparse parameters
         if self.lars is not None and not isinstance(grad, core.GradientSlice):
             assert self.lars >= 0, (
                 'Lars offset must be nonnegative, got {}'.format(self.lars))
+            wd, trust, lr_max = self.create_lars_inputs(
+                param_init_net, 0.0, 1.0, np.finfo(np.float32).max)
             lr_lars_multiplier = net.Lars(
-                [param, grad],
+                [param, grad, wd, trust, lr_max],
                 self.make_unique_blob_name(str(param) + "_lars"),
-                offset=self.lars)
+                offset=self.lars,
+                lr_min=0.0)
             current_scope = scope.CurrentDeviceScope()
-            self.add_lr_multiplier(
+            self._add_local_lr_multiplier(
                 lr_lars_multiplier,
                 is_gpu_blob=(current_scope is not None
                     and current_scope.device_type == caffe2_pb2.CUDA),
@@ -492,15 +526,21 @@ class AdagradOptimizer(Optimizer):
         if self.alpha <= 0:
             return
 
+        self._clear_local_lr_multiplier()
+
         if self.lars is not None and not isinstance(grad, core.GradientSlice):
             assert self.lars >= 0, (
                 'Lars offset must be nonnegative, got {}'.format(self.lars))
+            wd, trust, lr_max = self.create_lars_inputs(
+                param_init_net, 0.0, 1.0, np.finfo(np.float32).max)
             lr_lars_multiplier = net.Lars(
-                [param, grad],
+                [param, grad, wd, trust, lr_max],
                 self.make_unique_blob_name(str(param) + "_lars"),
-                offset=self.lars)
+                offset=self.lars,
+                lr_min=0.0)
+
             current_scope = scope.CurrentDeviceScope()
-            self.add_lr_multiplier(
+            self._add_local_lr_multiplier(
                 lr_lars_multiplier,
                 is_gpu_blob=(current_scope is not None
                     and current_scope.device_type == caffe2_pb2.CUDA),
@@ -587,6 +627,165 @@ class AdagradOptimizer(Optimizer):
         return
 
 
+class WngradOptimizer(Optimizer):
+    def __init__(self, alpha=1.0, epsilon=1e-9, policy="fixed",
+                 sparse_dedup_aggregator=None, engine='', moment_init=100.0,
+                 lars=None, output_effective_lr=False,
+                 output_effective_lr_and_update=False, **kwargs):
+        super(WngradOptimizer, self).__init__()
+        self.alpha = alpha
+        self.epsilon = epsilon
+        self.policy = policy
+        self.sparse_dedup_aggregator = sparse_dedup_aggregator
+        self.engine = engine
+        self.moment_init = moment_init
+        self.lars = lars
+        self.output_effective_lr = output_effective_lr
+        self.output_effective_lr_and_update = output_effective_lr_and_update
+        self.init_kwargs = kwargs
+
+    def _run(self, net, param_init_net, param_info):
+        param = param_info.blob
+        grad = param_info.grad
+
+        if self.alpha <= 0:
+            return
+
+        self._clear_local_lr_multiplier()
+
+        if self.lars is not None and not isinstance(grad, core.GradientSlice):
+            assert self.lars >= 0, (
+                'Lars offset must be nonnegative, got {}'.format(self.lars))
+            wd, trust, lr_max = self.create_lars_inputs(
+                param_init_net, 0.0, 1.0, np.finfo(np.float32).max)
+            lr_lars_multiplier = net.Lars(
+                [param, grad, wd, trust, lr_max],
+                self.make_unique_blob_name(str(param) + "_lars"),
+                offset=self.lars,
+                lr_min=0.0)
+            current_scope = scope.CurrentDeviceScope()
+            self._add_local_lr_multiplier(
+                lr_lars_multiplier,
+                is_gpu_blob=(current_scope is not None
+                    and current_scope.device_type == caffe2_pb2.CUDA),
+            )
+
+        lr, _ = self.build_lr(
+            net, param_init_net,
+            base_learning_rate=self.alpha,
+            policy=self.policy,
+            **(self.init_kwargs)
+        )
+
+        moment = param_init_net.ConstantFill(
+            [],
+            str(param) + "_moment",
+            shape=[1],
+            value=self.moment_init
+        )
+
+        self._aux_params.local.append(moment)
+
+        if isinstance(grad, core.GradientSlice):
+            grad = self.dedup(net, self.sparse_dedup_aggregator, grad)
+            net.SparseWngrad(
+                [param, moment, grad.indices, grad.values, lr],
+                [param, moment],
+                epsilon=self.epsilon,
+                engine=self.engine
+            )
+        else:
+            output_args = [param, moment]
+            if self.output_effective_lr_and_update:
+                output_args.append(str(param) + '_effective_lr')
+                output_args.append(str(param) + '_update')
+            elif self.output_effective_lr:
+                output_args.append(str(param) + '_effective_lr')
+
+            net.Wngrad(
+                [param, moment, grad, lr],
+                output_args,
+                epsilon=self.epsilon,
+                engine=self.engine
+            )
+
+    def scale_learning_rate(self, scale):
+        self.alpha *= scale
+        return
+
+
+class AdadeltaOptimizer(Optimizer):
+    def __init__(self, alpha=0.01, epsilon=1e-4, decay=0.95, policy="fixed",
+                 sparse_dedup_aggregator=None, engine='', **kwargs):
+        """Constructor function to add Adadelta Optimizer
+
+        Args:
+            alpha: learning rate
+            epsilon: attribute of Adadelta to avoid numerical issues
+            decay: attribute of Adadelta to decay the squared gradient sum
+            policy: specifies how learning rate should be applied, options are
+              "fixed", "step", "exp", etc.
+            sparse_dedup_aggregator: specifies deduplication strategy for
+              gradient slices. Works while using sparse gradients. Options
+              include "mean" and "sum".
+            engine: the engine used, options include "", "CUDNN", etc.
+        """
+        super(AdadeltaOptimizer, self).__init__()
+        self.alpha = alpha
+        self.epsilon = epsilon
+        self.decay = decay
+        self.policy = policy
+        self.sparse_dedup_aggregator = sparse_dedup_aggregator
+        self.engine = engine
+        self.init_kwargs = kwargs
+
+    def _run(self, net, param_init_net, param_info):
+        param = param_info.blob
+        grad = param_info.grad
+
+        if self.alpha <= 0:
+            return
+
+        lr, _ = self.build_lr(
+            net, param_init_net,
+            base_learning_rate=self.alpha,
+            policy=self.policy,
+            **(self.init_kwargs)
+        )
+
+        moment = param_init_net.ConstantFill(
+            [param], str(param) + "_squared_moment", value=0.0)
+
+        moment_update = param_init_net.ConstantFill(
+            [param], str(param) + "_squared_moment_update", value=0.0)
+
+        self._aux_params.local.append(moment)
+        self._aux_params.local.append(moment_update)
+
+        if isinstance(grad, core.GradientSlice):
+            grad = self.dedup(net, self.sparse_dedup_aggregator, grad)
+            net.SparseAdadelta(
+                [
+                    param, moment, moment_update, grad.indices,
+                    grad.values, lr
+                ], [param, moment, moment_update],
+                epsilon=self.epsilon,
+                decay=self.decay,
+                engine=self.engine)
+        else:
+            net.Adadelta(
+                [param, moment, moment_update, grad, lr],
+                [param, moment, moment_update],
+                epsilon=self.epsilon,
+                decay=self.decay,
+                engine=self.engine
+            )
+
+    def scale_learning_rate(self, scale):
+        self.alpha *= scale
+        return
+
+
 class FtrlOptimizer(Optimizer):
     def __init__(self, alpha=0.01, beta=1e-4, lambda1=0, lambda2=0,
                  sparse_dedup_aggregator=None, engine=''):
@@ -639,16 +838,62 @@ class FtrlOptimizer(Optimizer):
         return
 
 
+class GFtrlOptimizer(Optimizer):
+    """Group Lasso FTRL Optimizer."""
+
+    def __init__(self, alpha=0.01, beta=1e-4, lambda1=0, lambda2=0,
+                 sparse_dedup_aggregator=None, engine=''):
+        super(GFtrlOptimizer, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.lambda1 = lambda1
+        self.lambda2 = lambda2
+        self.sparse_dedup_aggregator = sparse_dedup_aggregator
+        self.engine = engine
+
+    def _run(self, net, param_init_net, param_info):
+        param = param_info.blob
+        grad = param_info.grad
+
+        if self.alpha <= 0:
+            return
+
+        nz = param_init_net.ConstantFill(
+            [param],
+            str(param) + "_gftrl_nz",
+            extra_shape=[2],
+            value=0.0
+        )
+        self._aux_params.local.append(nz)
+        net.GFtrl(
+            [param, nz, grad],
+            [param, nz],
+            engine=self.engine,
+            alpha=self.alpha,
+            beta=self.beta,
+            lambda1=self.lambda1,
+            lambda2=self.lambda2
+        )
+
+    def scale_learning_rate(self, scale):
+        self.alpha *= scale
+        return
+
+
 class AdamOptimizer(Optimizer):
     def __init__(self, alpha=0.001, beta1=0.9, beta2=0.999, epsilon=1e-8,
-                 policy='fixed', sparse_dedup_aggregator=None, rowWise=False,
-                 engine='', **kwargs):
+                 policy='fixed', use_lr_adaption=False, lr_alpha=0.01,
+                 normalized_lr_adaption=True, sparse_dedup_aggregator=None,
+                 rowWise=False, engine='', **kwargs):
         super(AdamOptimizer, self).__init__()
         self.alpha = alpha
         self.beta1 = beta1
         self.beta2 = beta2
         self.epsilon = epsilon
         self.policy = policy
+        self.use_lr_adaption = use_lr_adaption
+        self.lr_alpha = lr_alpha
+        self.normalized_lr_adaption = normalized_lr_adaption
         self.sparse_dedup_aggregator = sparse_dedup_aggregator
         self.rowWise = rowWise
         self.engine = engine
@@ -668,11 +913,25 @@ class AdamOptimizer(Optimizer):
             **(self.init_kwargs)
         )
 
+        if self.use_lr_adaption:
+            effective_grad = param_init_net.ConstantFill(
+                [param],
+                param + "_effgrad",
+                value=0.0
+            )
+            self._aux_params.local.append(effective_grad)
+            net.LearningRateAdaption(
+                [lr, grad, effective_grad],
+                [lr],
+                lr_alpha=self.lr_alpha,
+                normalized_lr_adaption=self.normalized_lr_adaption)
+
         m1 = param_init_net.ConstantFill(
             [param],
             param + "_first_moment",
             value=0.0
         )
+
         if self.rowWise:
             shapes, types = workspace.InferShapesAndTypes([param_init_net])
             m2 = param_init_net.ConstantFill(
@@ -681,9 +940,7 @@ class AdamOptimizer(Optimizer):
                 shape=[shapes[param][0]],
                 value=0.0
             )
-
         else:
-
             m2 = param_init_net.ConstantFill(
                 [param],
                 param + "_second_moment",
@@ -714,12 +971,20 @@ class AdamOptimizer(Optimizer):
             )
 
         else:
-            net.Adam(
-                [param, m1, m2, grad, lr, iteration],
-                [param, m1, m2],
-                beta1=self.beta1,
-                beta2=self.beta2,
-                epsilon=self.epsilon)
+            if self.use_lr_adaption:
+                net.Adam(
+                    [param, m1, m2, grad, lr, iteration],
+                    [param, m1, m2, effective_grad],
+                    beta1=self.beta1,
+                    beta2=self.beta2,
+                    epsilon=self.epsilon)
+            else:
+                net.Adam(
+                    [param, m1, m2, grad, lr, iteration],
+                    [param, m1, m2],
+                    beta1=self.beta1,
+                    beta2=self.beta2,
+                    epsilon=self.epsilon)
 
     def scale_learning_rate(self, scale):
         self.alpha *= scale
@@ -806,20 +1071,11 @@ class YellowFinOptimizer(Optimizer):
         assert not isinstance(grad, core.GradientSlice), \
             "YellowFin does not support sparse gradients"
 
-        if not param_init_net.BlobIsDefined(_OPTIMIZER_ITERATION_NAME):
-            # Add training operators.
-            with core.DeviceScope(core.DeviceOption(caffe2_pb2.CPU)):
-                iteration = param_init_net.ConstantFill(
-                    [],
-                    _OPTIMIZER_ITERATION_NAME,
-                    shape=[1],
-                    value=0,
-                    dtype=core.DataType.INT64)
-                iter_mutex = param_init_net.CreateMutex([],
-                                                        ["iteration_mutex"])
-                net.AtomicIter([iter_mutex, iteration], [iteration])
-        else:
-            iteration = param_init_net.GetBlobRef(_OPTIMIZER_ITERATION_NAME)
+        iteration = utils.BuildUniqueMutexIter(
+            param_init_net,
+            net,
+            iter_val=0
+        )
 
         self._aux_params.shared.append(iteration)
         self._aux_params.local.append(moment)
@@ -1107,12 +1363,11 @@ def _build(
 
     for param_info in params:
         param_name = str(param_info.blob)
-
         device = get_param_device(param_name, param_info.grad, param_to_device)
-
         with core.DeviceScope(device):
             if param_info.optimizer and use_param_info_optim:
-                param_info.optimizer(model.net, model.param_init_net, param_info)
+                param_info.optimizer(
+                    model.net, model.param_init_net, param_info)
             else:
                 optimizer(model.net, model.param_init_net, param_info)
     return optimizer
@@ -1183,6 +1438,13 @@ def build_ftrl(model, engine="SIMD", **kwargs):
     return _build(model, ftrl_optimizer)
 
 
+def build_gftrl(model, engine="", **kwargs):
+    if engine == "SIMD":
+        assert core.IsOperator('GFtrl_ENGINE_SIMD')
+    gftrl_optimizer = GFtrlOptimizer(engine=engine, **kwargs)
+    return _build(model, gftrl_optimizer)
+
+
 def build_adagrad(
     model,
     base_learning_rate,
@@ -1195,6 +1457,40 @@ def build_adagrad(
     return _build(
         model,
         adagrad_optimizer,
+        max_gradient_norm=max_gradient_norm,
+        allow_lr_injection=allow_lr_injection,
+    )
+
+
+def build_wngrad(
+    model,
+    base_learning_rate,
+    parameters=None,
+    max_gradient_norm=None,
+    allow_lr_injection=False,
+    **kwargs
+):
+    wngrad_optimizer = WngradOptimizer(alpha=base_learning_rate, **kwargs)
+    return _build(
+        model,
+        wngrad_optimizer,
+        max_gradient_norm=max_gradient_norm,
+        allow_lr_injection=allow_lr_injection,
+    )
+
+
+def build_adadelta(
+    model,
+    base_learning_rate,
+    parameters=None,
+    max_gradient_norm=None,
+    allow_lr_injection=False,
+    **kwargs
+):
+    adadelta_optimizer = AdadeltaOptimizer(alpha=base_learning_rate, **kwargs)
+    return _build(
+        model,
+        adadelta_optimizer,
         max_gradient_norm=max_gradient_norm,
         allow_lr_injection=allow_lr_injection,
     )

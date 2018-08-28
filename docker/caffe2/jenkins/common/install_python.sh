@@ -139,6 +139,10 @@ fi
 # version explicitly before scikit-image pulls it in as a dependency
 pip install networkx==2.0
 
+# click - onnx
+# pyyaml - needed to build Aten
+# hypothesis - tests
+# jupyter - for tutorials
 pip install --no-cache-dir \
     click \
     future \
@@ -147,11 +151,13 @@ pip install --no-cache-dir \
     numpy \
     protobuf \
     pytest \
+    pyyaml \
     scipy==0.19.1 \
     scikit-image \
     tabulate \
     virtualenv \
     mock \
     typing \
-    typing-extensions
+    typing-extensions \
+    pyyaml
 

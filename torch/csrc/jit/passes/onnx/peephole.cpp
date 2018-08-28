@@ -1,6 +1,7 @@
 #include "torch/csrc/jit/passes/onnx/peephole.h"
+#include "torch/csrc/jit/assertions.h"
 
-#include <ATen/optional.h>
+#include <ATen/core/optional.h>
 
 #if defined(_MSC_VER)
 #include <BaseTsd.h>
@@ -23,14 +24,21 @@ bool isNopTranspose(const std::vector<int64_t> & perm) {
 
 // returns a vector `ret` such that transposing by `ret` is equivalent
 // to transposing by `t1` and then by `t2`
+//
+// This fires in the case that we have transpose ops T1 -> T2. We are
+// fusing the transpose op T1 into T2 and discarding T1. We assume the elements
+// of the permutation in `t1` are raw indices into its input, since a previous
+// iteration would have folded all the transposes up to that point. Thus,
+// `ret[i] = t1[t2[i]]` says "the output of t2 at position i takes the value of
+// the input tensor index contained in t1 at position `t2[i]``".
 std::vector<int64_t> composeTransposes(const std::vector<int64_t> & t1,
                                        const std::vector<int64_t> & t2) {
   JIT_ASSERT(t1.size() == t2.size());
   std::vector<int64_t> ret;
-  for (size_t i = 0; i < t1.size(); i++) {
-    JIT_ASSERT(   t1[i]  < int64_t(t2.size()));
-    JIT_ASSERT(t2[t1[i]] < int64_t(t2.size()));
-    ret.push_back(t2[t1[i]]);
+  ret.reserve(t1.size());
+  for (size_t i = 0; i < t2.size(); i++) {
+    JIT_ASSERT(t2[i] < int64_t(t1.size()));
+    ret.push_back(t1[t2[i]]);
   }
   return ret;
 }
@@ -88,12 +96,18 @@ void fuseBroadcast(Block *b) {
     JIT_ASSERT(!n->hasAttribute(attr::axis));
 
     auto input_index = n->inputs().size() - 1;
-    auto* expanded_rhs = n->input(input_index)->node();
+    auto* rhs_expand = n->input(input_index)->node();
 
-    // The expanded_rhs input isn't actually an expand, so no fusion available
-    if (expanded_rhs->kind() != aten::expand) continue;
+    // The rhs_expand input isn't actually an expand, so no fusion available
+    // XXX: we can't use the ->matches(...) mechanism in here, because input nodes
+    //      have been
+    if (rhs_expand->kind() != aten::expand ||
+        rhs_expand->input(1)->node()->kind() != onnx::Constant ||
+        rhs_expand->input(2)->node()->kind() != onnx::Constant) {
+      continue;
+    }
 
-    auto* unexpanded_rhs = expanded_rhs->input();
+    auto* unexpanded_rhs = rhs_expand->input(0);
 
     // We need to know what the type pre-expand is.  We should basically
     // always have this information (because expands are only ever traced,
@@ -103,24 +117,14 @@ void fuseBroadcast(Block *b) {
 
     // Not all broadcasts are supported by ONNX broadcast.
     at::optional<size_t> axis = fusibleExpandTo(
-        unexpanded_rhs->type()->expect<TensorType>()->sizes(), // from
-        expanded_rhs->output()->type()->expect<TensorType>()->sizes()); // to
+        unexpanded_rhs->type()->expect<CompleteTensorType>()->sizes(), // from
+        rhs_expand->output()->type()->expect<CompleteTensorType>()->sizes()); // to
     if (axis == at::nullopt)
       continue;
 
     n->replaceInput(input_index, unexpanded_rhs);
-    n->i_(attr::broadcast, 1);
-    if (axis) {
-      // Gemm doesn't support the axis argument, so be sure to omit it
-      // for that op. It also only supports an axis of 1.
-      if (n->kind() == onnx::Gemm) {
-        JIT_ASSERT(axis.value() == 1);
-      } else {
-        n->i_(attr::axis, axis.value());
-      }
-    }
-    if (!expanded_rhs->hasUses()) {
-      expanded_rhs->destroy();
+    if (!rhs_expand->hasUses()) {
+      rhs_expand->destroy();
     }
   }
 }
@@ -208,7 +212,7 @@ void pushPackingPastRnn(Block *b) {
     if (n->kind() != prim::PackPadded) {
       continue;
     }
-    if (n->outputs()[0]->uses().size() != 1) {
+    if (n->outputs().at(0)->uses().size() != 1) {
       // For now, only handle the case where there is one consumer.
       continue;
     }
@@ -220,24 +224,61 @@ void pushPackingPastRnn(Block *b) {
     if(rnn->owningBlock() != n->owningBlock())
       continue;
 
+    // Packing only has an effect on a network when its outputs are actually used,
+    // so we can remove it here.
+    if (rnn->outputs().at(0)->uses().empty() && n->outputs().at(1)->uses().size() == 1) {
+      n->outputs().at(0)->replaceAllUsesWith(n->inputs().at(0));
+      n->outputs().at(1)->replaceFirstUseWith(n->inputs().at(1));
+      it.destroyCurrent();
+      continue;
+    }
+
+    // The rnn is followed by a transpose and a reshape (if
+    // bidirectional), or by a squeeze (if unidirectional).
+    Node * next = rnn->outputs().at(0)->uses().at(0).user;
+    if (next->kind() == onnx::Transpose) {
+      next = next->outputs().at(0)->uses().at(0).user;
+      if (next->kind() != onnx::Reshape) {
+        continue;
+      }
+    } else if (next->kind() != onnx::Squeeze) {
+      continue;
+    }
+
     // remove PackPadded from in front of the RNN
-    n->outputs()[0]->replaceAllUsesWith(n->inputs()[0]);
+    n->outputs().at(0)->replaceAllUsesWith(n->inputs().at(0));
 
     // note there can be multiple uses of the length blob. If we are
     // translating a multi-level RNN it will be an input to each level.
-    n->outputs()[1]->replaceFirstUseWith(n->inputs()[1]);
+    n->outputs().at(1)->replaceFirstUseWith(n->inputs().at(1));
 
     // and insert new PackPadded after the RNN
     Node * newPackPadded = b->owningGraph()->create(prim::PackPadded, 2);
-    newPackPadded->insertAfter(rnn);
+    newPackPadded->insertAfter(next);
 
     // make things consume from the new PackPadded
-    rnn->outputs()[0]->replaceAllUsesWith(newPackPadded->outputs()[0]);
-    n->outputs()[1]->replaceAllUsesWith(newPackPadded->outputs()[1]);
+    next->outputs().at(0)->replaceAllUsesWith(newPackPadded->outputs().at(0));
+    n->outputs().at(1)->replaceAllUsesWith(newPackPadded->outputs().at(1));
 
     // setup the new PackPadded's inputs
-    newPackPadded->addInput(rnn->outputs()[0]);
-    newPackPadded->addInput(n->inputs()[1]);
+    newPackPadded->addInput(next->outputs().at(0));
+    newPackPadded->addInput(n->inputs().at(1));
+
+    // See https://github.com/pytorch/pytorch/issues/9043 for a full
+    // description.  Since PackPadded is for now treated in an
+    // unhygenic way, Pytorch ends up propagating an incorrect type.
+    // Until a long-term cleanup comes around, we can fix this by
+    // resetting the size to the correct value.
+    CompleteTensorTypePtr oldType = rnn->inputs().at(0)->type()->cast<CompleteTensorType>();
+    if (oldType) {
+      std::vector<int64_t> new_sizes;
+      new_sizes.push_back(oldType->sizes().at(0));
+      new_sizes.push_back(oldType->sizes().at(1));
+      new_sizes.push_back(rnn->i(attr::hidden_size));
+      CompleteTensorTypePtr newType = CompleteTensorType::create(
+          oldType->scalarType(), oldType->device(), new_sizes);
+      next->outputs().at(0)->setType(newType);
+    }
 
     it.destroyCurrent();
   }
@@ -268,6 +309,24 @@ void removeNopPacking(Block* graph) {
 
     n->removeAllInputs();
     it.destroyCurrent();
+  }
+}
+
+void hackFixupPadPackedShapes(Block* graph) {
+  // FIXME: the shape of the input to the fictional PadPacked node has
+  // incorrect shape. For now, just copy the shape of PadPacked to the shape
+  // of its input.
+  for (auto it = graph->nodes().begin(); it != graph->nodes().end(); ++it) {
+    auto* n = *it;
+    for (auto *child_block : n->blocks()) {
+      removeNopPacking(child_block);
+    }
+
+    if (n->kind() != prim::PadPacked) {
+      continue;
+    }
+    Node* input = n->inputs()[0]->node();
+    input->outputs()[0]->setType(n->outputs()[0]->type());
   }
 }
 
@@ -310,7 +369,7 @@ void fixDefaultRNNState(Graph* graph, Node * n, int input_index) {
 
   Node * hidden_size = graph->create(onnx::Constant, 1);
   hidden_size->insertBefore(n);
-  hidden_size->t_(attr::value, at::CPU(at::kLong).tensor({1}).fill_(n->i(attr::hidden_size))); // at::Scalar(n->i(attr::hidden_size)).toTensor());
+  hidden_size->t_(attr::value, at::full({1}, n->i(attr::hidden_size), at::kLong)); // at::Scalar(n->i(attr::hidden_size)).toTensor());
 
   Node * num_directions = graph->create(onnx::Constant, 1);
   num_directions->insertBefore(n);
@@ -407,6 +466,45 @@ static void speculateOps(Block* block) {
   }
 }
 
+static void replaceInputWithList(Node *node, size_t i, ArrayRef<Value*> to) {
+  node->removeInput(i);
+  for (auto* to_val : to) {
+    JIT_ASSERT(to_val->owningGraph() == node->owningGraph());
+    node->insertInput(i++, to_val);
+  }
+}
+
+static void eraseListConstruct(Block* block) {
+  for (auto it = block->nodes().begin(), end = block->nodes().end();
+       it != end;) {
+    Node* n = *it;
+    ++it;
+
+    for (auto b : n->blocks()) {
+      eraseListConstruct(b);
+    }
+
+    std::vector<std::tuple<size_t, std::vector<Value*>>> replacements;
+
+    size_t i = 0;
+    for (auto* input : n->inputs()) {
+      if (input->node()->kind() == prim::ListConstruct) {
+        auto* lc_node = input->node();
+        replacements.push_back(std::make_tuple(
+            i,
+            std::vector<Value*>(
+                lc_node->inputs().begin(), lc_node->inputs().end())));
+      }
+      i++;
+    }
+
+    for (auto ritr = replacements.rbegin(); ritr != replacements.rend();
+         ++ritr) {
+      replaceInputWithList(n, std::get<0>(*ritr), std::get<1>(*ritr));
+    }
+  }
+}
+
 // This optimization does ONNX-specific peephole optimizations.
 //
 // At the moment, here are the optimizations it does:
@@ -428,6 +526,7 @@ void PeepholeOptimizeONNX(std::shared_ptr<Graph>& graph) {
   // TODO: decide on fixpoint strategy
   // TODO: make it easier not to do O(k) iterations over the graph, where
   // k is the number of distinct peephole optimizations
+  hackFixupPadPackedShapes(graph->block());
   pushPackingPastRnn(graph->block());
   removeNopPacking(graph->block());
   fixDefaultRnnHiddenState(graph->block());
@@ -437,6 +536,7 @@ void PeepholeOptimizeONNX(std::shared_ptr<Graph>& graph) {
   eliminateNopTranspose(graph->block());
   fuseTransposeIntoGemm(graph->block());
   speculateOps(graph->block());
+  eraseListConstruct(graph->block());
 }
 
 }}

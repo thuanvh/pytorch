@@ -21,7 +21,7 @@ IF(C_AVX2_FOUND)
 ENDIF(C_AVX2_FOUND)
 
 SET(hdr
-  THGeneral.h THHalf.h THAllocator.h THSize.h THStorage.h THTensor.h THTensorApply.h THBlas.h THMath.h
+  THGeneral.h THHalf.h THAllocator.h THSize.h THStorage.h THStorageFunctions.h THTensor.h THTensorApply.h THBlas.h THMath.h
   THLapack.h THLogAdd.h THRandom.h THVector.h )
 
 set(ATen_TH_SRCS
@@ -29,8 +29,15 @@ set(ATen_TH_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/THHalf.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/THAllocator.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/THSize.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/THStorage.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/THStorageFunctions.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/THTensor.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/THTensorCopy.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/THTensorRandom.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/THTensorMath.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/THTensorMoreMath.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/THTensorEvenMoreMath.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/THTensorConv.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/THTensorLapack.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/THBlas.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/THLapack.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/THLogAdd.cpp
@@ -48,7 +55,13 @@ set(ATen_CPU_SRCS ${ATen_CPU_SRCS} ${ATen_TH_SRCS} PARENT_SCOPE)
 
 
 set(ATen_CPU_INCLUDE ${ATen_CPU_INCLUDE}
-  "${CMAKE_CURRENT_BINARY_DIR}"
+  ${CMAKE_CURRENT_BINARY_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}
+PARENT_SCOPE)
+
+set(ATen_CUDA_INCLUDE ${ATen_CUDA_INCLUDE}
+  ${CMAKE_CURRENT_BINARY_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}
 PARENT_SCOPE)
 
 CONFIGURE_FILE(THGeneral.h.in "${CMAKE_CURRENT_BINARY_DIR}/THGeneral.h")
@@ -80,15 +93,16 @@ INSTALL(FILES
   THRandom.h
   THSize.h
   THStorage.h
+  THStorageFunctions.h
   THTensor.h
   THTensorApply.h
   THTensorDimApply.h
-  THTensorMacros.h
   THVector.h
   THHalf.h
   THTensor.hpp
-  THStorage.hpp
+  THStorageFunctions.hpp
   THGenerator.hpp
+  THTypeConversion.hpp
   DESTINATION "${ATEN_INSTALL_INCLUDE_SUBDIR}/TH")
 
 INSTALL(FILES
@@ -108,6 +122,7 @@ INSTALL(FILES
   generic/THStorageCopy.h
   generic/THTensor.cpp
   generic/THTensor.h
+  generic/THTensor.hpp
   generic/THTensorConv.cpp
   generic/THTensorConv.h
   generic/THTensorCopy.cpp
@@ -121,6 +136,5 @@ INSTALL(FILES
   generic/THVectorDispatch.cpp
   generic/THVector.h
   # See Note [TH abstraction violation]
-  generic/THStorage.hpp
-  generic/THTensor.hpp
+  generic/THTensorFastGetSet.hpp
   DESTINATION "${ATEN_INSTALL_INCLUDE_SUBDIR}/TH/generic")

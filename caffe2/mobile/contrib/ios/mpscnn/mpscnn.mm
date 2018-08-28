@@ -68,6 +68,14 @@
 - (void*)weights {
   return self.weights_;
 }
+
+- (id)copyWithZone:(NSZone*)zone {
+  ConvDataSource* newDataSource = [[self class] allocWithZone:zone];
+  newDataSource.weights_ = self.weights_;
+  newDataSource.bias_ = self.bias_;
+  newDataSource.desc_ = self.desc_;
+  return newDataSource;
+}
 @end
 
 namespace caffe2 {
@@ -248,9 +256,9 @@ void computeOutputHW(
     int W,
     int* OH,
     int* OW) {
-  Tensor<CPUContext> input, output;
+  Tensor input(CPU), output(CPU);
   input.Resize(1, 1, H, W);
-  op->SetOutputSize<CPUContext>(input, &output, 1);
+  op->SetOutputSize(input, &output, 1);
   CAFFE_ENFORCE_EQ(output.ndim(), 4);
   *OH = output.dim(2);
   *OW = output.dim(3);
@@ -481,13 +489,13 @@ class MPSCNNPackedInt8BGRANHWCToNCHWCStylizerPreprocessOp final
         "noise_size", 491 /* prime to avoid artifacts */);
     // Treaded as half4 in the kernel, so need half4 here.
     noiseSize = divRoundUp(noiseSize, 4) * 4;
-    if (!noiseBlob->IsType<TensorCPU>() ||
+    if (!noiseBlob->IsType<Tensor>(CPU) ||
         noiseBlob->Get<TensorCPU>().size() != noiseSize) {
       VLOG(2) << "Initializing stylizer with noise: " << noiseSize;
       caffe2::Timer rt;
       // Initialize random noise on first use.
       // Cache it to maintain temporal consistency.
-      auto* t = noiseBlob->template GetMutable<TensorCPU>();
+      auto* t = noiseBlob->GetMutableTensor(CPU);
       t->Resize(noiseSize);
       math::RandGaussian<float, CPUContext>(
           t->size(),
@@ -2547,6 +2555,63 @@ class MPSCNNResizeNearestOp final : public Operator<CPUContext> {
 
 REGISTER_CPU_OPERATOR(MPSCNNResizeNearest, MPSCNNResizeNearestOp);
 OPERATOR_SCHEMA(MPSCNNResizeNearest).NumInputs(1).NumOutputs(1);
+
+class MPSCNNChannelShuffleOp final : public ConvPoolOpBase<CPUContext> {
+ public:
+  MPSCNNChannelShuffleOp(const OperatorDef& operator_def, Workspace* ws)
+      : ConvPoolOpBase<CPUContext>(operator_def, ws) {
+    OPERATOR_NEEDS_FEATURE(
+        this->order_ == StorageOrder::NCHW, "Metal only supports NCHW order.");
+    kernel_[0] = kernel_[1] = 1;
+  }
+
+  bool RunOnDeviceWithOrderNCHW() override {
+    caffe2::Timer t;
+    auto inputWrapper = Inputs()[0]->Get<MPSImageWrapper>();
+    MPSImage* X = inputWrapper.getImage();
+    CAFFE_ENFORCE_EQ(X.featureChannels % this->group_, 0);
+    auto output_height = X.height;
+    auto output_width = X.width;
+    auto outputWrapper = MPSImageWrapper(
+        this,
+        &inputWrapper,
+        X.numberOfImages,
+        output_height,
+        output_width,
+        X.featureChannels);
+    auto commandBuffer = outputWrapper.getCommandBuffer();
+    MPSImage* output = outputWrapper.getImage();
+    CAFFE_ENFORCE_EQ(output.height, output_height);
+    CAFFE_ENFORCE_EQ(output.width, output_width);
+    id<MTLComputeCommandEncoder> encoder =
+        [commandBuffer computeCommandEncoder];
+    id<MTLComputePipelineState> state =
+        getMPSCNNContext().getSpecializedPipelineState(
+            @"channel_shuffle",
+            {{
+                ushort(X.numberOfImages),
+                ushort(X.featureChannels),
+                ushort(X.featureChannels / this->group_),
+                ushort(this->group_),
+            }});
+    [encoder setComputePipelineState:state];
+    [encoder setTexture:[X texture] atIndex:0];
+    [encoder setTexture:[output texture] atIndex:1];
+    const auto& launchParams =
+        spatialPointwiseKernelLaunchParams(state, output);
+    [encoder dispatchThreadgroups:launchParams.threadgroupsPerGrid
+            threadsPerThreadgroup:launchParams.threadsPerThreadgroup];
+    [encoder endEncoding];
+    inputWrapper.markRead();
+    outputWrapper.copyToOutputBlob(Outputs()[0]);
+
+    VLOG(2) << "ChannelShuffle took: " << t.MilliSeconds();
+    return true;
+  }
+};
+
+REGISTER_CPU_OPERATOR(MPSCNNChannelShuffle, MPSCNNChannelShuffleOp);
+OPERATOR_SCHEMA(MPSCNNChannelShuffle).NumInputs(1).NumOutputs(1);
 }
 
 CAFFE_KNOWN_TYPE(MPSImageWrapper);

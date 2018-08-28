@@ -23,8 +23,12 @@ def _find_cuda_home():
     if cuda_home is None:
         # Guess #2
         if sys.platform == 'win32':
-            cuda_home = glob.glob(
+            cuda_homes = glob.glob(
                 'C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v*.*')
+            if len(cuda_homes) == 0:
+                cuda_home = ''
+            else:
+                cuda_home = cuda_homes[0]
         else:
             cuda_home = '/usr/local/cuda'
         if not os.path.exists(cuda_home):
@@ -36,6 +40,8 @@ def _find_cuda_home():
                 cuda_home = os.path.dirname(os.path.dirname(nvcc))
             except Exception:
                 cuda_home = None
+    if cuda_home and not torch.cuda.is_available():
+        print("No CUDA runtime is found, using CUDA_HOME='{}'".format(cuda_home))
     return cuda_home
 
 
@@ -56,7 +62,15 @@ for instructions on how to install GCC 4.9 or higher.
 
                               !! WARNING !!
 '''
-CUDA_HOME = _find_cuda_home() if torch.cuda.is_available() else None
+CUDA_HOME = _find_cuda_home()
+# PyTorch releases have the version pattern major.minor.patch, whereas when
+# PyTorch is built from source, we append the git commit hash, which gives
+# it the below pattern.
+BUILT_FROM_SOURCE_VERSION_PATTERN = re.compile(r'\d+\.\d+\.\d+\w+\+\w+')
+
+
+def is_binary_build():
+    return not BUILT_FROM_SOURCE_VERSION_PATTERN.match(torch.version.__version__)
 
 
 def check_compiler_abi_compatibility(compiler):
@@ -71,6 +85,8 @@ def check_compiler_abi_compatibility(compiler):
         False if the compiler is (likely) ABI-incompatible with PyTorch,
         else True.
     '''
+    if not is_binary_build():
+        return True
     try:
         check_cmd = '{}' if sys.platform == 'win32' else '{} --version'
         info = subprocess.check_output(
@@ -126,6 +142,7 @@ class BuildExtension(build_ext):
         self._check_abi()
         for extension in self.extensions:
             self._define_torch_extension_name(extension)
+            self._add_gnu_abi_flag_if_binary(extension)
 
         # Register .cu and .cuh as valid source extensions.
         self.compiler.src_extensions += ['.cu', '.cuh']
@@ -258,6 +275,21 @@ class BuildExtension(build_ext):
         else:
             extension.extra_compile_args.append(define)
 
+    def _add_gnu_abi_flag_if_binary(self, extension):
+        # If the version string looks like a binary build,
+        # we know that PyTorch was compiled with gcc 4.9.2.
+        # if the extension is compiled with gcc >= 5.1,
+        # then we have to define _GLIBCXX_USE_CXX11_ABI=0
+        # so that the std::string in the API is resolved to
+        # non-C++11 symbols
+        define = '-D_GLIBCXX_USE_CXX11_ABI=0'
+        if is_binary_build():
+            if isinstance(extension.extra_compile_args, dict):
+                for args in extension.extra_compile_args.values():
+                    args.append(define)
+            else:
+                extension.extra_compile_args.append(define)
+
 
 def CppExtension(name, sources, *args, **kwargs):
     '''
@@ -294,7 +326,8 @@ def CppExtension(name, sources, *args, **kwargs):
         kwargs['library_dirs'] = library_dirs
 
         libraries = kwargs.get('libraries', [])
-        libraries.append('ATen')
+        libraries.append('caffe2')
+        libraries.append('torch')
         libraries.append('_C')
         kwargs['libraries'] = libraries
 
@@ -337,7 +370,9 @@ def CUDAExtension(name, sources, *args, **kwargs):
     libraries = kwargs.get('libraries', [])
     libraries.append('cudart')
     if sys.platform == 'win32':
-        libraries.append('ATen')
+        libraries.append('caffe2')
+        libraries.append('torch')
+        libraries.append('caffe2_gpu')
         libraries.append('_C')
     kwargs['libraries'] = libraries
 
@@ -407,7 +442,8 @@ def load(name,
          extra_ldflags=None,
          extra_include_paths=None,
          build_directory=None,
-         verbose=False):
+         verbose=False,
+         with_cuda=None):
     '''
     Loads a PyTorch C++ extension just-in-time (JIT).
 
@@ -455,6 +491,11 @@ def load(name,
             to the build.
         build_directory: optional path to use as build workspace.
         verbose: If ``True``, turns on verbose logging of load steps.
+        with_cuda: Determines whether CUDA headers and libraries are added to
+            the build. If set to ``None`` (default), this value is
+            automatically determined based on the existence of ``.cu`` or
+            ``.cuh`` in ``sources``. Set it to `True`` to force CUDA headers
+            and libraries to be included.
 
     Returns:
         The loaded PyTorch extension as a Python module.
@@ -475,7 +516,8 @@ def load(name,
         extra_ldflags,
         extra_include_paths,
         build_directory or _get_build_directory(name, verbose),
-        verbose)
+        verbose,
+        with_cuda=with_cuda)
 
 
 def load_inline(name,
@@ -487,7 +529,8 @@ def load_inline(name,
                 extra_ldflags=None,
                 extra_include_paths=None,
                 build_directory=None,
-                verbose=False):
+                verbose=False,
+                with_cuda=None):
     '''
     Loads a PyTorch C++ extension just-in-time (JIT) from string sources.
 
@@ -529,6 +572,11 @@ def load_inline(name,
         functions: A list of function names for which to generate function
             bindings. If a dictionary is given, it should map function names to
             docstrings (which are otherwise just the function names).
+        with_cuda: Determines whether CUDA headers and libraries are added to
+            the build. If set to ``None`` (default), this value is
+            automatically determined based on whether ``cuda_sources`` is
+            provided. Set it to `True`` to force CUDA headers
+            and libraries to be included.
 
     Example:
         >>> from torch.utils.cpp_extension import load_inline
@@ -542,8 +590,6 @@ def load_inline(name,
                                  functions=['sin_add'])
     '''
     build_directory = build_directory or _get_build_directory(name, verbose)
-
-    source_files = []
 
     if isinstance(cpp_sources, str):
         cpp_sources = [cpp_sources]
@@ -597,7 +643,8 @@ def load_inline(name,
         extra_ldflags,
         extra_include_paths,
         build_directory,
-        verbose)
+        verbose,
+        with_cuda=with_cuda)
 
 
 def _jit_compile(name,
@@ -607,13 +654,15 @@ def _jit_compile(name,
                  extra_ldflags,
                  extra_include_paths,
                  build_directory,
-                 verbose):
+                 verbose,
+                 with_cuda=None):
     baton = FileBaton(os.path.join(build_directory, 'lock'))
     if baton.try_acquire():
         try:
             verify_ninja_availability()
             check_compiler_abi_compatibility(os.environ.get('CXX', 'c++'))
-            with_cuda = any(map(_is_cuda_file, sources))
+            if with_cuda is None:
+                with_cuda = any(map(_is_cuda_file, sources))
             extra_ldflags = _prepare_ldflags(
                 extra_ldflags or [],
                 with_cuda,
@@ -668,7 +717,10 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose):
         torch_path = os.path.dirname(os.path.dirname(here))
         lib_path = os.path.join(torch_path, 'lib')
 
-        extra_ldflags.append('ATen.lib')
+        extra_ldflags.append('caffe2.lib')
+        extra_ldflags.append('torch.lib')
+        if with_cuda:
+            extra_ldflags.append('caffe2_gpu.lib')
         extra_ldflags.append('_C.lib')
         extra_ldflags.append('/LIBPATH:{}'.format(python_lib_path))
         extra_ldflags.append('/LIBPATH:{}'.format(lib_path))
@@ -736,6 +788,11 @@ def _write_ninja_file(path,
                       extra_ldflags,
                       extra_include_paths,
                       with_cuda=False):
+    extra_cflags = [flag.strip() for flag in extra_cflags]
+    extra_cuda_cflags = [flag.strip() for flag in extra_cuda_cflags]
+    extra_ldflags = [flag.strip() for flag in extra_ldflags]
+    extra_include_paths = [flag.strip() for flag in extra_include_paths]
+
     # Version 1.3 is required for the `deps` directive.
     config = ['ninja_required_version = 1.3']
     config.append('cxx = {}'.format(os.environ.get('CXX', 'c++')))
@@ -754,6 +811,9 @@ def _write_ninja_file(path,
 
     common_cflags = ['-DTORCH_EXTENSION_NAME={}'.format(name)]
     common_cflags += ['-I{}'.format(include) for include in includes]
+
+    if is_binary_build():
+        common_cflags += ['-D_GLIBCXX_USE_CXX11_ABI=0']
 
     cflags = common_cflags + ['-fPIC', '-std=c++11'] + extra_cflags
     if sys.platform == 'win32':
@@ -813,7 +873,7 @@ def _write_ninja_file(path,
             '  command = "{}/link.exe" $in /nologo $ldflags /out:$out'.format(
                 cl_path))
     else:
-        link_rule.append('  command = $cxx $ldflags $in -o $out')
+        link_rule.append('  command = $cxx $in $ldflags -o $out')
 
     # Emit one build rule per source to enable incremental build.
     object_files = []
@@ -821,7 +881,7 @@ def _write_ninja_file(path,
     for source_file in sources:
         # '/path/to/file.cpp' -> 'file'
         file_name = os.path.splitext(os.path.basename(source_file))[0]
-        if _is_cuda_file(source_file):
+        if _is_cuda_file(source_file) and with_cuda:
             rule = 'cuda_compile'
             # Use a different object filename in case a C++ and CUDA file have
             # the same filename but different extension (.cpp vs. .cu).

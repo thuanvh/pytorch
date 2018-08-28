@@ -122,8 +122,8 @@ struct Tensor : public detail::TensorBase {
   int64_t storage_offset() const;
   Tensor & resize_(IntList size);
   int64_t numel() const;
-  Tensor & set_(Storage & storage);
-  Tensor & set_(Storage & sourceStorage, int64_t storage_offset, IntList size, IntList stride={});
+  Tensor & set_(Storage & source);
+  Tensor & set_(Storage & source, int64_t storage_offset, IntList size, IntList stride={});
   Tensor & set_(const Tensor & source);
   Tensor & set_();
   Tensor & fill_(Scalar value);
@@ -252,6 +252,8 @@ struct Tensor : public detail::TensorBase {
   Tensor tanh() const;
   Tensor & erf_();
   Tensor erf() const;
+  Tensor & erfc_();
+  Tensor erfc() const;
   Tensor & erfinv_();
   Tensor erfinv() const;
   Tensor & sqrt_();
@@ -394,7 +396,8 @@ struct Tensor : public detail::TensorBase {
   Tensor & _copy_ignoring_overlaps_(const Tensor & src);
   Tensor as_strided(IntList size, IntList stride, int64_t storage_offset=-1) const;
   Tensor & as_strided_(IntList size, IntList stride, int64_t storage_offset=-1);
-  Tensor & sparse_raw_resize_(IntList size, int64_t nDimI, int64_t nDimV);
+  Tensor & sparse_resize_(IntList size, int64_t nDimI, int64_t nDimV);
+  Tensor & sparse_resize_and_clear_(IntList size, int64_t nDimI, int64_t nDimV);
   Tensor & reshape_(IntList size, IntList stride);
   Tensor _sparse_mask(SparseTensor mask) const;
   Tensor to_dense() const;

@@ -8,14 +8,13 @@ from torch.distributions.utils import broadcast_all
 
 class Exponential(ExponentialFamily):
     r"""
-    Creates a Exponential distribution parameterized by `rate`.
+    Creates a Exponential distribution parameterized by :attr:`rate`.
 
     Example::
 
         >>> m = Exponential(torch.tensor([1.0]))
         >>> m.sample()  # Exponential distributed with rate=1
-         0.1046
-        [torch.FloatTensor of size 1]
+        tensor([ 0.1046])
 
     Args:
         rate (float or Tensor): rate = 1 / scale of the distribution

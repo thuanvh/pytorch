@@ -8,10 +8,12 @@ from caffe2.python.dataio import (
     CompositeReaderBuilder,
     Reader,
     ReaderBuilder,
+    ReaderWithDelay,
     ReaderWithLimit,
     ReaderWithTimeLimit,
 )
 from caffe2.python.dataset import Dataset
+from caffe2.python.db_file_reader import DBFileReader
 from caffe2.python.pipeline import pipe
 from caffe2.python.schema import Struct, NewRecord, FeedRecord
 from caffe2.python.session import LocalSession
@@ -50,36 +52,6 @@ def make_destination_dataset(ws, schema, name=None):
         dst_ds.init_empty(dst_init)
     ws.run(dst_init)
     return dst_ds
-
-
-def read_all_data(ws, reader, session):
-    dst_ds = make_destination_dataset(ws, reader.schema().clone_schema())
-
-    with TaskGroup(workspace_type=WorkspaceType.GLOBAL) as tg:
-        pipe(reader, dst_ds.writer(), num_runtime_threads=8)
-    session.run(tg)
-
-    return ws.blobs[str(dst_ds.content().label())].fetch()
-
-
-class ReaderWithDelay(Reader):
-    """Test reader class that inserts a delay between reading batches."""
-    def __init__(self, reader, delay):
-        Reader.__init__(self, schema=reader._schema)
-        self.reader = reader
-        self.delay = delay
-
-    def setup_ex(self, global_init_net, global_finish_net):
-        self.reader.setup_ex(global_init_net, global_finish_net)
-
-    def read_ex(self, local_init_net, local_finish_net):
-        read_net = core.Net('reader_body')
-
-        def sleep_op(*args, **argd):
-            time.sleep(self.delay)
-
-        read_net.Python(sleep_op)([], [])
-        return ([read_net], ) + self.reader.read(read_net)
 
 
 class TestReaderBuilder(ReaderBuilder):
@@ -345,46 +317,104 @@ class TestReaderWithLimit(TestCase):
                                        read_delay=0.25,
                                        duration=6)
 
+
+class TestDBFileReader(TestCase):
+    def setUp(self):
+        self.temp_paths = []
+
+    def tearDown(self):
+        # In case any test method fails, clean up temp paths.
+        for path in self.temp_paths:
+            self._delete_path(path)
+
+    @staticmethod
+    def _delete_path(path):
+        if os.path.isfile(path):
+            os.remove(path)  # Remove file.
+        elif os.path.isdir(path):
+            shutil.rmtree(path)  # Remove dir recursively.
+
+    def _make_temp_path(self):
+        # Make a temp path as db_path.
+        with tempfile.NamedTemporaryFile() as f:
+            temp_path = f.name
+        self.temp_paths.append(temp_path)
+        return temp_path
+
+    @staticmethod
+    def _build_source_reader(ws, size):
+        src_ds = make_source_dataset(ws, size)
+        return src_ds.reader()
+
+    @staticmethod
+    def _read_all_data(ws, reader, session):
+        dst_ds = make_destination_dataset(ws, reader.schema().clone_schema())
+
+        with TaskGroup() as tg:
+            pipe(reader, dst_ds.writer(), num_runtime_threads=8)
+        session.run(tg)
+
+        return ws.blobs[str(dst_ds.content().label())].fetch()
+
     def test_cached_reader(self):
         ws = workspace.C.Workspace()
         session = LocalSession(ws)
-
-        def build_source_reader(size):
-            src_ds = make_source_dataset(ws, size)
-            return src_ds.reader()
-
-        # Make a temp file path as cache_path
-        with tempfile.NamedTemporaryFile(delete=False) as f:
-            cache_path = f.name
-            f.close()
-            os.remove(cache_path)
+        db_path = self._make_temp_path()
 
         # Read data for the first time.
-        cached_reader1 = CachedReader(build_source_reader(100))
-        init_step = cached_reader1.build_cache(cache_path)
-        session.run(init_step)
+        cached_reader1 = CachedReader(
+            self._build_source_reader(ws, 100), db_path,
+        )
+        build_cache_step = cached_reader1.build_cache_step()
+        session.run(build_cache_step)
 
-        data = read_all_data(ws, cached_reader1, session)
+        data = self._read_all_data(ws, cached_reader1, session)
         self.assertEqual(sorted(data), list(range(100)))
 
         # Read data from cache.
-        workspace.ResetWorkspace()
-        cached_reader2 = CachedReader(build_source_reader(200))
-        init_step = cached_reader2.build_cache(cache_path)
-        session.run(init_step)
+        cached_reader2 = CachedReader(
+            self._build_source_reader(ws, 200), db_path,
+        )
+        build_cache_step = cached_reader2.build_cache_step()
+        session.run(build_cache_step)
 
-        data = read_all_data(ws, cached_reader2, session)
+        data = self._read_all_data(ws, cached_reader2, session)
         self.assertEqual(sorted(data), list(range(100)))
 
-        shutil.rmtree(cache_path)
+        self._delete_path(db_path)
 
-        # We removed cache so we expect to receive data from original reader
-        workspace.ResetWorkspace()
-        cached_reader3 = CachedReader(build_source_reader(300))
-        init_step = cached_reader3.build_cache(cache_path)
-        session.run(init_step)
+        # We removed cache so we expect to receive data from original reader.
+        cached_reader3 = CachedReader(
+            self._build_source_reader(ws, 300), db_path,
+        )
+        build_cache_step = cached_reader3.build_cache_step()
+        session.run(build_cache_step)
 
-        data = read_all_data(ws, cached_reader3, session)
+        data = self._read_all_data(ws, cached_reader3, session)
         self.assertEqual(sorted(data), list(range(300)))
 
-        shutil.rmtree(cache_path)
+        self._delete_path(db_path)
+
+    def test_db_file_reader(self):
+        ws = workspace.C.Workspace()
+        session = LocalSession(ws)
+        db_path = self._make_temp_path()
+
+        # Build a cache DB file.
+        cached_reader = CachedReader(
+            self._build_source_reader(ws, 100),
+            db_path=db_path,
+            db_type='LevelDB',
+        )
+        build_cache_step = cached_reader.build_cache_step()
+        session.run(build_cache_step)
+
+        # Read data from cache DB file.
+        db_file_reader = DBFileReader(
+            db_path=db_path,
+            db_type='LevelDB',
+        )
+        data = self._read_all_data(ws, db_file_reader, session)
+        self.assertEqual(sorted(data), list(range(100)))
+
+        self._delete_path(db_path)

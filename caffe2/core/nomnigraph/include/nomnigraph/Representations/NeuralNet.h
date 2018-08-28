@@ -17,7 +17,9 @@
 #include "nomnigraph/Representations/ControlFlow.h"
 #include "nomnigraph/Support/Casting.h"
 #include "nomnigraph/Support/Pointer.h"
+#include "nomnigraph/Transformations/SubgraphMatcher.h"
 
+#include <sstream>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -44,6 +46,7 @@ class Annotation {
 
   Annotation(AnnotationKind K) : Kind(K) {}
   Annotation() : Kind(AnnotationKind::Generic) {}
+  virtual ~Annotation() {}
 
   AnnotationKind getKind() const {
     return Kind;
@@ -52,16 +55,8 @@ class Annotation {
   Annotation(const Annotation&) = delete;
   Annotation& operator=(Annotation&) = delete;
 
-  void* getSaved() const {
-    return Saved;
-  }
-  void setSaved(void* saved) {
-    Saved = saved;
-  }
-
  private:
   const AnnotationKind Kind;
-  void* Saved = nullptr;
 };
 
 class NeuralNetOperator : public Instruction {
@@ -241,13 +236,15 @@ class GenericOperator : public NeuralNetOperator {
   std::string name_;
 };
 
-using NNGraph = nom::Graph<std::unique_ptr<nom::repr::Value>, int>;
-using NNSubgraph = nom::Subgraph<std::unique_ptr<nom::repr::Value>, int>;
+using NNGraph = nom::Graph<std::unique_ptr<nom::repr::Value>>;
+using NNSubgraph = nom::Subgraph<std::unique_ptr<nom::repr::Value>>;
 using NNCFGraph = nom::repr::ControlFlowGraph<NNGraph>;
 
 struct NNModule {
   NNGraph dataFlow;
   NNCFGraph controlFlow;
+  std::unordered_set<NNGraph::NodeRef> inputs;
+  std::unordered_set<NNGraph::NodeRef> outputs;
   NNModule(const NNModule&) = delete;
   NNModule(NNModule&&) = default;
   NNModule() {}
@@ -263,7 +260,8 @@ using enable_if_t = typename std::enable_if<B, T>::type;
 
 template <typename T, typename U>
 struct inheritedFrom {
-    static constexpr bool value = std::is_base_of<U, T>::value && !std::is_same<U, T>::value;
+  static constexpr bool value =
+      std::is_base_of<U, T>::value && !std::is_same<U, T>::value;
 };
 
 // This is just a way to fix issues when the isa<> implementation
@@ -341,6 +339,18 @@ inline T* get(N n) {
 }
 
 template <typename T, typename G>
+std::vector<typename G::NodeRef> nodeIterator(G& g) {
+  std::vector<typename G::NodeRef> out;
+  for (auto node : g.getMutableNodes()) {
+    if (!is<T>(node)) {
+      continue;
+    }
+    out.emplace_back(node);
+  }
+  return out;
+}
+
+template <typename T, typename G>
 std::vector<std::pair<T*, typename G::NodeRef>> dataIterator(G& g) {
   std::vector<std::pair<T*, typename G::NodeRef>> out;
   for (auto node : g.getMutableNodes()) {
@@ -387,7 +397,6 @@ template <typename NewT, typename OldT>
 NNGraph::NodeRef convertNode(NNGraph& g, NNGraph::NodeRef node) {
   assert(is<OldT>(node) && "Cannot get type from node.");
 
-  auto* nnOp = get<NeuralNetOperator>(node);
   NeuralNetOperator* nnOpPtr =
       dyn_cast<NeuralNetOperator>(node->mutableData()->release());
 
@@ -402,7 +411,6 @@ NNGraph::NodeRef convertNode(NNGraph& g, NNGraph::NodeRef node) {
 
 /// NeuralNetData specific helpers.
 bool hasProducer(NNGraph::NodeRef n);
-bool hasProducer(NNGraph::NodeRef n);
 NNGraph::NodeRef getProducer(NNGraph::NodeRef n);
 bool hasConsumer(NNGraph::NodeRef n);
 std::vector<NNGraph::NodeRef> getConsumers(NNGraph::NodeRef n);
@@ -415,6 +423,83 @@ void coalesceInsertedDataDependencies(repr::NNModule* m);
 
 template <NNGraph* G>
 struct NodeHelper {};
+
+struct NNNodeMatchCriteria {
+  const std::function<bool(NNGraph::NodeRef)> predicate;
+  const std::string debugString;
+
+  NNNodeMatchCriteria(
+      const std::function<bool(NNGraph::NodeRef)>& predicate,
+      const std::string& debugString = "No debug string specified")
+      : predicate(predicate), debugString(debugString){};
+
+  NNNodeMatchCriteria andCriteria(const NNNodeMatchCriteria& other) {
+    auto thisPredicate = predicate;
+    auto otherPredicate = other.predicate;
+    return NNNodeMatchCriteria(
+        [thisPredicate, otherPredicate](NNGraph::NodeRef node) {
+          return thisPredicate(node) && otherPredicate(node);
+        },
+        debugString + " and " + other.debugString);
+  }
+};
+
+std::ostream& operator<<(
+    std::ostream& oss,
+    const NNNodeMatchCriteria& criteria);
+
+using NNMatchGraph = nom::matcher::MatchGraph<NNNodeMatchCriteria>;
+using NNMatchNode = nom::matcher::MatchNode<NNNodeMatchCriteria>;
+
+// Commonly used criteria.
+
+// The node has a single output and the output has a single consumer.
+NNNodeMatchCriteria criteriaSingleOutputAndConsumer();
+// The node has a unique consumer (there may be multiple edges from output
+// to the single consumer).
+NNNodeMatchCriteria criteriaSingleConsumer();
+
+template <typename NodeType>
+NNNodeMatchCriteria matchOp(const std::string& debugString = "matchOp") {
+  return NNNodeMatchCriteria(
+      [](NNGraph::NodeRef nodeRef) { return is<NodeType>(nodeRef); },
+      debugString);
+}
+
+NNNodeMatchCriteria matchTensor();
+
+template <typename NodeType>
+NNNodeMatchCriteria matchOp(
+    const std::function<bool(const NodeType&)> predicate,
+    const std::string& debugString = "matchOpWithPredicate") {
+  return NNNodeMatchCriteria(
+      [&predicate](NNGraph::NodeRef nodeRef) {
+        NOM_REQUIRE_OR_RET_FALSE(is<NodeType>(nodeRef));
+        NodeType* node = get<NodeType>(nodeRef);
+        return predicate(*node);
+      },
+      debugString);
+};
+
+struct NNNodeMatch {
+  static bool isMatch(
+      const NNGraph::NodeRef& node,
+      const NNNodeMatchCriteria& criteria) {
+    return criteria.predicate(node);
+  }
+};
+
+using NNSubgraphMatcher =
+    nom::matcher::SubgraphMatcher<NNGraph, NNNodeMatchCriteria, NNNodeMatch>;
+
+// This helper method makes it easy to create matching criteria in NNGraph.
+// For example, operatorSubgraph(opMatch, ...) will refer to a tree like this:
+// ... -> opMatch -> opMatch_Output
+NNMatchGraph::NodeRef operatorSubgraph(
+    NNMatchGraph& g,
+    const NNNodeMatchCriteria& root,
+    const std::vector<NNMatchGraph::NodeRef>& childrenCriteria = {},
+    int count = 1);
 
 } // namespace nn
 

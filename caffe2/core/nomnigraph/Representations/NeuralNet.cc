@@ -92,7 +92,7 @@ std::vector<NNGraph::NodeRef> getOutputs(NNGraph::NodeRef n) {
 }
 
 // Get all nodes tracked by CF graph
-std::unordered_set<repr::NNGraph::NodeRef> getTrackedNodes(
+static std::unordered_set<repr::NNGraph::NodeRef> getTrackedNodes(
     repr::NNCFGraph& cf) {
   std::unordered_set<repr::NNGraph::NodeRef> cfTrackedNodes;
   for (const auto& bbNode : cf.getMutableNodes()) {
@@ -104,7 +104,7 @@ std::unordered_set<repr::NNGraph::NodeRef> getTrackedNodes(
   return cfTrackedNodes;
 }
 
-size_t coalesceInsertedDataDependenciesHelper(repr::NNModule* m) {
+static size_t coalesceInsertedDataDependenciesHelper(repr::NNModule* m) {
   auto cfTrackedNodes = getTrackedNodes(m->controlFlow);
 
   for (auto& bbNode : m->controlFlow.getMutableNodes()) {
@@ -148,17 +148,85 @@ void coalesceInsertedDataDependencies(repr::NNModule* m) {
     }
   }
 
-  auto bbNode = m->controlFlow.createNode(
+  auto newBbNode = m->controlFlow.createNode(
       util::make_unique<repr::BasicBlockType<repr::NNGraph>>());
   auto sccs = algorithm::tarjans(&m->dataFlow);
   for (auto iter = sccs.rbegin(); iter != sccs.rend(); ++iter) {
     for (auto node : iter->getNodes()) {
       if (dfNodes.count(node)) {
-        auto currentBasicBlock = bbNode->mutableData()->get();
+        auto currentBasicBlock = newBbNode->mutableData()->get();
         currentBasicBlock->pushInstructionNode(node);
       }
     }
   }
+
+  // Finally we reconcile any data dependency issues (if we can).
+  for (auto& bbNode : m->controlFlow.getMutableNodes()) {
+    auto bb = bbNode->mutableData()->get();
+    std::unordered_set<repr::NNGraph::NodeRef> seen;
+    for (auto instr_iter = bb->getInstructions().begin();
+         instr_iter != bb->getInstructions().end();
+         ++instr_iter) {
+      // This cannot be auto&, TODO figure out why
+      auto instr = *instr_iter;
+      for (auto& output : getOutputs(instr)) {
+        for (auto& consumer : getConsumers(output)) {
+          if (seen.count(consumer)) {
+            bb->moveInstructionBefore(instr, consumer);
+          }
+        }
+      }
+      seen.insert(instr);
+    }
+  }
+}
+
+std::ostream& operator<<(
+    std::ostream& oss,
+    const NNNodeMatchCriteria& criteria) {
+  return oss << criteria.debugString;
+}
+
+NNNodeMatchCriteria criteriaSingleOutputAndConsumer() {
+  return NNNodeMatchCriteria(
+      [](NNGraph::NodeRef nodeRef) {
+        auto nodeOutputs = nn::getOutputs(nodeRef);
+        NOM_REQUIRE_OR_RET_FALSE(nodeOutputs.size() == 1);
+        auto nodeConsumers = nn::getConsumers(nodeOutputs.front());
+        return nodeConsumers.size() == 1;
+      },
+      "Single output and consumer");
+}
+
+NNNodeMatchCriteria criteriaSingleConsumer() {
+  return NNNodeMatchCriteria(
+      [](NNGraph::NodeRef nodeRef) {
+        auto nodeOutputs = nn::getOutputs(nodeRef);
+        NNGraph::NodeRef nodeConsumer = nullptr;
+        for (auto nodeOutput : nodeOutputs) {
+          for (auto consumer : nn::getConsumers(nodeOutput)) {
+            if (nodeConsumer && consumer && consumer != nodeConsumer) {
+              return false;
+            }
+            nodeConsumer = consumer;
+          }
+        }
+        return true;
+      },
+      "Single consumer");
+}
+
+NNNodeMatchCriteria matchTensor() {
+  return matchOp<nom::repr::Tensor>("matchTensor");
+}
+
+NNMatchGraph::NodeRef operatorSubgraph(
+    NNMatchGraph& g,
+    const NNNodeMatchCriteria& root,
+    const std::vector<NNMatchGraph::NodeRef>& childrenCriteria,
+    int count) {
+  return subgraph(
+      g, matchTensor(), {subgraph(g, root, childrenCriteria)}, count);
 }
 
 } // namespace nn

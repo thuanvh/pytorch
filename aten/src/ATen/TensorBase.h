@@ -2,79 +2,52 @@
 
 #include "ATen/TensorImpl.h"
 #include "ATen/UndefinedTensor.h"
+#include "ATen/core/Error.h"
 
 namespace at { namespace detail {
 
-// TensorBase is the base class for Tensor which handles the reference counting
+// TensorBase is the base class for Tensor.
+// TODO: Eliminate this, once we remove TensorBase from Scalar.  At
+// the moment it's only used to break an include cycle for Scalar
 struct TensorBase {
-  TensorBase(): TensorBase(UndefinedTensor::singleton(), false) {}
-  TensorBase(TensorImpl * self, bool retain)
-  : pImpl(self) {
-    if (pImpl == nullptr) {
-      throw std::runtime_error("TensorBase with nullptr not supported");
+  TensorBase() {}
+  TensorBase(TensorImpl * tensor_impl, bool retain) : tensor_impl_(c10::intrusive_ptr<TensorImpl, UndefinedTensor>::reclaim(tensor_impl)) {
+    if (tensor_impl == nullptr) {
+      throw std::runtime_error("TensorBaseImpl with nullptr not supported");
     }
-    if(retain && pImpl != UndefinedTensor::singleton())
-      pImpl->retain();
+    if (retain && tensor_impl != UndefinedTensor::singleton()) {
+      c10::raw::intrusive_ptr::incref(tensor_impl);
+    }
   }
-  TensorBase(const TensorBase & rhs)
-  : pImpl(rhs.pImpl) {
-    if (pImpl != UndefinedTensor::singleton())
-      pImpl->retain();
-  }
-  TensorBase(TensorBase && rhs) noexcept
-  : pImpl(rhs.pImpl) {
-    rhs.pImpl = UndefinedTensor::singleton();
-  }
-  ~TensorBase() {
-    if (pImpl != UndefinedTensor::singleton())
-      pImpl->release();
-  }
-  TensorBase & operator=(TensorBase && rhs) & {
-    rhs.swap(*this);
-    return *this;
-  }
-  TensorBase & operator=(TensorBase const & rhs) & {
-      //TensorBase ctor retains original rhs.pImpl
-      //then rhs.pImpl is swapped with this->pImpl
-      //finally TensorBase dtor releases rhs.pImpl, which was originally this->pImpl
-      TensorBase(rhs).swap(*this);
-      return *this;
-  }
+  TensorBase(c10::intrusive_ptr<TensorImpl, UndefinedTensor>&& ptr) : tensor_impl_(std::move(ptr)) {}
+  TensorBase(const c10::intrusive_ptr<TensorImpl, UndefinedTensor>& ptr) : tensor_impl_(ptr) {}
+
   int64_t dim() const {
-    return pImpl->dim();
+    return tensor_impl_->dim();
   }
-  void reset() {
-    TensorBase().swap(*this);
+
+  TensorImpl * unsafeGetTensorImpl() const {
+    return tensor_impl_.get();
   }
-  void reset(TensorImpl * rhs) {
-    TensorBase(rhs, true).swap(*this);
+  TensorImpl * unsafeReleaseTensorImpl() {
+    return tensor_impl_.release();
   }
-  void reset(TensorImpl * rhs, bool retain) {
-    TensorBase(rhs, retain).swap(*this );
-  }
-  void swap(TensorBase & rhs) {
-    TensorImpl * tmp = pImpl;
-    pImpl = rhs.pImpl;
-    rhs.pImpl = tmp;
-  }
-  TensorImpl * get() const {
-    return pImpl;
-  }
-  TensorImpl * detach() {
-    TensorImpl * ret = pImpl;
-    pImpl = UndefinedTensor::singleton();
-    return ret;
+  const c10::intrusive_ptr<TensorImpl, UndefinedTensor>& getIntrusivePtr() const {
+    return tensor_impl_;
   }
 
   bool defined() const {
-    return pImpl != UndefinedTensor::singleton();
+    return tensor_impl_;
   }
 
-  friend struct Type;
+  void reset() {
+    tensor_impl_.reset();
+  }
 
-  //TODO(zach): sort out friend structes
-public:
-  TensorImpl * pImpl;
+  friend struct WeakTensor;
+
+protected:
+  c10::intrusive_ptr<TensorImpl, UndefinedTensor> tensor_impl_;
 };
 
 }} // namespace at::detail

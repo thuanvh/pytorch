@@ -14,6 +14,7 @@ from caffe2.python import \
 from caffe2.proto import caffe2_pb2
 
 import numpy as np
+import warnings
 
 dyndep.InitOpsLibrary("@/caffe2/caffe2/contrib/nccl:nccl_ops")
 dyndep.InitOpsLibrary("@/caffe2/caffe2/contrib/gloo:gloo_ops")
@@ -686,15 +687,18 @@ def Parallelize_BMUF(
     ]
     _AddBarrierToModelNets(model_helper_obj, barrier_net_timeout_sec)
 
+def CreateNet(model, overwrite=False):
+    for net_iters in model._data_parallel_model_nets:
+        if isinstance(net_iters, tuple):
+            workspace.CreateNet(net_iters[0], overwrite=overwrite)
+        else:
+            workspace.CreateNet(net_iters, overwrite=overwrite)
+
 
 def RunInitNet(model):
     for init_net in model._data_parallel_model_init_nets:
         workspace.RunNetOnce(init_net)
-    for net_iters in model._data_parallel_model_nets:
-        if isinstance(net_iters, tuple):
-            workspace.CreateNet(net_iters[0])
-        else:
-            workspace.CreateNet(net_iters)
+    CreateNet(model)
 
 
 def RunWarmup(model):
@@ -717,40 +721,54 @@ def _AddBarrierToModelNets(model, barrier_net_timeout_sec):
         # shards that are faster than others will begin training the next epoch
         # while stragglers are blocked on IO, and may timeout after 30 seconds
         # (_DEFAULT_TIMEOUT_SEC).
-        model._barrier_net = _CreateBarrierNet(model,
-                "pre_training", barrier_net_timeout_sec)
+        # We pass in model.param_init_net so that the barrier net can be run as
+        # part of the param_init_net.
+
+        model._barrier_init_net = core.Net("barrier_init_net")
+
+        model._barrier_net = _CreateBarrierNet(model, model._barrier_init_net,
+        "pre_training", barrier_net_timeout_sec)
+
+        model._data_parallel_model_init_nets.insert(0, model._barrier_init_net)
+
         model._data_parallel_model_nets.insert(0, model._barrier_net)
 
 
-def _CreateBarrierNet(model, name_prefix, timeout_sec):
+def _CreateBarrierNet(model, init_net, name_prefix, timeout_sec):
     log.info("Creating barrier net")
     assert model._rendezvous['engine'] == 'GLOO', "Engine does not support barrier"
-    barrier_init_net = core.Net(name_prefix + "_barrier_init_net")
     comm_world = _CreateOrCloneCommonWorld(
-        barrier_init_net,
+        init_net,
         name_prefix + "_barrier_cw",
         rendezvous=model._rendezvous,
-        status_blob=name_prefix + "_barrier_cw_status",
         timeout_sec=timeout_sec,
     )
-    workspace.RunNetOnce(barrier_init_net)
     barrier_net = core.Net(name_prefix + "_barrier_net")
     barrier_net.Barrier(
         inputs=[comm_world],
         outputs=[],
         engine=model._rendezvous['engine'],
-        status_blob=name_prefix + "_barrier_status",
     )
     return barrier_net
 
 
+# DEPRECATED: See warnings below.
 def Synchronize(model, timeout_sec=_DEFAULT_BARRIER_NET_TIMEOUT_SEC):
+    warnings.warn("The Synchronize API has been deprecated.  We now have a "
+            "barrier net which runs before training to ensure all hosts wait "
+            "before training starts.  The default timeout for the barrier is "
+            "300s and it can be overridden using the barrier_net_timeout_sec "
+            "parameter when calling Parallelize.",
+            category=DeprecationWarning, stacklevel=2)
     if model._rendezvous is None or model._rendezvous['num_shards'] <= 1:
         # Single host case
         return
 
     if model._sync_barrier_net is None:
-        model._sync_barrier_net = _CreateBarrierNet(model, "sync", timeout_sec)
+        barrier_init_net = core.Net("sync_barrier_init_net")
+        model._sync_barrier_net = _CreateBarrierNet(
+            model, barrier_init_net, "sync", timeout_sec)
+        workspace.RunNetOnce(barrier_init_net)
         workspace.CreateNet(model._sync_barrier_net)
         model._sync_barrier_net_timeout = timeout_sec
     assert model._sync_barrier_net_timeout == timeout_sec, \
@@ -1103,16 +1121,12 @@ def AddDistributedBlobSync(model, blobs):
         model.param_init_net,
         "blob_sync_cw_" + synth_name,
         rendezvous=model._rendezvous,
-        status_blob="create_blob_sync_cw_{}_cw_status".format(
-            synth_name,
-        ),
     )
 
     model.net.Allreduce(
         inputs=[comm_world] + blobs,
         outputs=blobs,
         engine=model._rendezvous['engine'],
-        status_blob="blob_sync_allred_{}_status".format(synth_name),
     )
 
 
@@ -1150,7 +1164,6 @@ def _SyncAllParamsDistributed(
                 outputs=params,
                 name=param_name,
                 engine=rendezvous['engine'],
-                status_blob="broadcast_{}_status".format(str(param_name)),
                 control_input=control_input
             )
 
@@ -1281,10 +1294,6 @@ class CollectivesConcurrencyControl(object):
                 self.param_init_net,
                 "{}_{}_cw".format(self.name, current_slot),
                 rendezvous=self.rendezvous,
-                status_blob="create_{}_cw_{}_status".format(
-                    self.name,
-                    current_slot
-                ),
             )
             self.common_worlds.append(common_world)
             self.control_inputs.append(control_output_blob)
@@ -1341,7 +1350,6 @@ def _AllReduceBlobsDistributed(
                     name=blob_name,
                     engine=all_reduce_engine,
                     control_input=control_input,
-                    status_blob="allreduce_{}_status".format(blob_name),
                     **kwargs
                 )
 
@@ -1748,7 +1756,6 @@ def _CreateOrCloneCommonWorld(
         common_world_blob,
         rendezvous,
         name=None,
-        status_blob=None,
         timeout_sec=None):
 
     if timeout_sec is None:
@@ -1787,7 +1794,6 @@ def _CreateOrCloneCommonWorld(
             common_world_blob,
             name=name,
             engine=rendezvous['engine'],
-            status_blob=status_blob,
         )
     else:
         kwargs=dict()
@@ -1804,7 +1810,6 @@ def _CreateOrCloneCommonWorld(
             size=rendezvous['num_shards'],
             rank=rendezvous['shard_id'],
             engine=rendezvous['engine'],
-            status_blob=status_blob,
             timeout_ms=timeout_ms,
             **kwargs
         )
@@ -1836,7 +1841,6 @@ def _RunComparison(model, blob_name, device=None):
             size=rendezvous['num_shards'],
             rank=rendezvous['shard_id'],
             engine=rendezvous['engine'],
-            status_blob="cw_master_select",
             **kwargs
         )
 
@@ -1856,7 +1860,6 @@ def _RunComparison(model, blob_name, device=None):
             inputs=[comm_world, blob_name_gather],
             outputs=[blob_name_gather],
             engine=rendezvous['engine'],
-            status_blob="all_reduce_master_select_status",
         )
 
         workspace.RunNetOnce(comparison_net)

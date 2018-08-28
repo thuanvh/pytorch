@@ -21,6 +21,8 @@
 #include "caffe2/utils/simple_queue.h"
 #include "caffe2/utils/thread_pool.h"
 
+CAFFE2_DECLARE_string(caffe2_override_executor);
+
 namespace caffe2 {
 
 class NetBase;
@@ -33,7 +35,7 @@ class Workspace;
 
 // Net is a thin struct that owns all the operators together with the operator
 // contexts.
-class NetBase : public Observable<NetBase> {
+class CAFFE2_API NetBase : public Observable<NetBase> {
  public:
   NetBase(const std::shared_ptr<const NetDef>& net_def, Workspace* ws);
   virtual ~NetBase() noexcept {}
@@ -56,12 +58,7 @@ class NetBase : public Observable<NetBase> {
       return false;
     }
     Wait();
-    for (const Event* event : events_) {
-      if (event->Query() != EventStatus::EVENT_SUCCESS) {
-        CAFFE_THROW(event->ErrorMessage());
-      }
-    }
-    return true;
+    return handleRunError();
   }
 
   virtual bool RunAsync();
@@ -78,10 +75,7 @@ class NetBase : public Observable<NetBase> {
   virtual vector<float> TEST_Benchmark(
       const int /*warmup_runs*/,
       const int /*main_runs*/,
-      const bool /*run_individual*/) {
-    LOG(ERROR) << "Benchmark not implemented for this net type.";
-    return vector<float>();
-  }
+      const bool /*run_individual*/);
 
   inline const vector<string>& external_output() const {
     return external_output_;
@@ -116,19 +110,27 @@ class NetBase : public Observable<NetBase> {
     CAFFE_THROW("Not implemented");
   };
 
+  virtual bool handleRunError() {
+    for (const Event* event : events_) {
+      if (event->Query() != EventStatus::EVENT_SUCCESS) {
+        CAFFE_THROW(event->ErrorMessage());
+      }
+    }
+    return true;
+  }
+
   vector<string> external_input_;
   vector<string> external_output_;
   string name_;
   vector<const Event*> events_;
   std::shared_ptr<const NetDef> net_def_;
-  DISABLE_COPY_AND_ASSIGN(NetBase);
+  AT_DISABLE_COPY_AND_ASSIGN(NetBase);
 };
 
-class ExecutorHelper {
+class CAFFE2_API ExecutorHelper {
  public:
   ExecutorHelper() {}
-  virtual std::shared_ptr<TaskThreadPool> GetPool(
-      const DeviceOption& option) const;
+  virtual TaskThreadPool* GetPool(const DeviceOption& option) const;
   virtual ~ExecutorHelper() {}
 };
 
@@ -149,14 +151,14 @@ CAFFE_DECLARE_REGISTRY(
  * created net object to the workspace's net map, while this function returns
  * a standalone net object.
  */
-unique_ptr<NetBase> CreateNet(const NetDef& net_def, Workspace* ws);
-unique_ptr<NetBase> CreateNet(
+CAFFE2_API unique_ptr<NetBase> CreateNet(const NetDef& net_def, Workspace* ws);
+CAFFE2_API unique_ptr<NetBase> CreateNet(
     const std::shared_ptr<const NetDef>& net_def,
     Workspace* ws);
 
-void AddGlobalNetObserverCreator(NetObserverCreator creator);
+CAFFE2_API void AddGlobalNetObserverCreator(NetObserverCreator creator);
 
-void ClearGlobalNetObservers();
+CAFFE2_API void ClearGlobalNetObservers();
 
 } // namespace caffe2
 

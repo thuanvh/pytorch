@@ -1,6 +1,7 @@
 from numbers import Number
 import torch
 import math
+from torch._six import nan
 from torch.distributions import constraints
 from torch.distributions.distribution import Distribution
 from torch.distributions.gamma import Gamma
@@ -9,14 +10,13 @@ from torch.distributions.utils import broadcast_all, _finfo
 
 class FisherSnedecor(Distribution):
     r"""
-    Creates a Fisher-Snedecor distribution parameterized by `df1` and `df2`.
+    Creates a Fisher-Snedecor distribution parameterized by :attr:`df1` and :attr:`df2`.
 
     Example::
 
         >>> m = FisherSnedecor(torch.tensor([1.0]), torch.tensor([2.0]))
         >>> m.sample()  # Fisher-Snedecor-distributed with df1=1 and df2=2
-         0.2453
-        [torch.FloatTensor of size 1]
+        tensor([ 0.2453])
 
     Args:
         df1 (float or Tensor): degrees of freedom parameter 1
@@ -40,13 +40,13 @@ class FisherSnedecor(Distribution):
     @property
     def mean(self):
         df2 = self.df2.clone()
-        df2[df2 <= 2] = float('nan')
+        df2[df2 <= 2] = nan
         return df2 / (df2 - 2)
 
     @property
     def variance(self):
         df2 = self.df2.clone()
-        df2[df2 <= 4] = float('nan')
+        df2[df2 <= 4] = nan
         return 2 * df2.pow(2) * (self.df1 + df2 - 2) / (self.df1 * (df2 - 2).pow(2) * (df2 - 4))
 
     def rsample(self, sample_shape=torch.Size(())):

@@ -7,25 +7,20 @@ from torch.distributions.utils import broadcast_all, probs_to_logits, lazy_prope
 
 class Binomial(Distribution):
     r"""
-    Creates a Binomial distribution parameterized by `total_count` and
-    either `probs` or `logits` (but not both). `total_count` must be
-    broadcastable with `probs`/`logits`.
+    Creates a Binomial distribution parameterized by :attr:`total_count` and
+    either :attr:`probs` or :attr:`logits` (but not both). :attr:`total_count` must be
+    broadcastable with :attr:`probs`/:attr:`logits`.
 
     Example::
 
         >>> m = Binomial(100, torch.tensor([0 , .2, .8, 1]))
         >>> x = m.sample()
-         0
-         22
-         71
-         100
-        [torch.FloatTensor of size 4]]
+        tensor([   0.,   22.,   71.,  100.])
 
-        >>> m = Binomial(torch.Tensor([[5.], [10.]]), torch.Tensor([0.5, 0.8]))
+        >>> m = Binomial(torch.tensor([[5.], [10.]]), torch.tensor([0.5, 0.8]))
         >>> x = m.sample()
-         4  5
-         7  6
-        [torch.FloatTensor of size (2,2)]
+        tensor([[ 4.,  5.],
+                [ 7.,  6.]])
 
     Args:
         total_count (int or Tensor): number of Bernoulli trials

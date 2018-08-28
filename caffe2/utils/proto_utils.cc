@@ -1,5 +1,7 @@
 #include "caffe2/utils/proto_utils.h"
 
+#include <ATen/core/DeviceType.h>
+
 #include <fcntl.h>
 #include <cerrno>
 #include <fstream>
@@ -17,55 +19,10 @@
 
 using ::google::protobuf::MessageLite;
 
-namespace caffe {
-
-// Caffe wrapper functions for protobuf's GetEmptyStringAlreadyInited() function
-// used to avoid duplicated global variable in the case when protobuf
-// is built with hidden visibility.
-const ::std::string& GetEmptyStringAlreadyInited() {
-  return ::google::protobuf::internal::GetEmptyStringAlreadyInited();
-}
-
-}  // namespace caffe
-
 namespace caffe2 {
 
-// Caffe2 wrapper functions for protobuf's GetEmptyStringAlreadyInited() function
-// used to avoid duplicated global variable in the case when protobuf
-// is built with hidden visibility.
-const ::std::string& GetEmptyStringAlreadyInited() {
-  return ::google::protobuf::internal::GetEmptyStringAlreadyInited();
-}
-
-void ShutdownProtobufLibrary() {
-  ::google::protobuf::ShutdownProtobufLibrary();
-}
-
 std::string DeviceTypeName(const int32_t& d) {
-  switch (d) {
-    case CPU:
-      return "CPU";
-    case CUDA:
-      return "CUDA";
-    case OPENGL:
-      return "OPENGL";
-    case OPENCL:
-      return "OPENCL";
-    case MKLDNN:
-      return "MKLDNN";
-    case IDEEP:
-      return "IDEEP";
-    default:
-      CAFFE_THROW(
-          "Unknown device: ",
-          d,
-          ". If you have recently updated the caffe2.proto file to add a new "
-          "device type, did you forget to update the DeviceTypeName() "
-          "function to reflect such recent changes?");
-      // The below code won't run but is needed to suppress some compiler
-      // warnings.
-      return "";
-  }
+  return at::DeviceTypeName(static_cast<at::DeviceType>(d));
 }
 
 int DeviceId(const DeviceOption& option) {
@@ -76,6 +33,8 @@ int DeviceId(const DeviceOption& option) {
       return option.cuda_gpu_id();
     case MKLDNN:
       return option.numa_node_id();
+    case HIP:
+      return option.hip_gpu_id();
     default:
       CAFFE_THROW("Unknown device id for device type: ", option.device_type());
   }
@@ -85,6 +44,7 @@ bool IsSameDevice(const DeviceOption& lhs, const DeviceOption& rhs) {
   return (
       lhs.device_type() == rhs.device_type() &&
       lhs.cuda_gpu_id() == rhs.cuda_gpu_id() &&
+      lhs.hip_gpu_id() == rhs.hip_gpu_id() &&
       lhs.node_name() == rhs.node_name() &&
       lhs.numa_node_id() == rhs.numa_node_id());
 }
@@ -149,8 +109,8 @@ string ProtoDebugString(const MessageLite& proto) {
 bool ParseProtoFromLargeString(const string& str, MessageLite* proto) {
   ::google::protobuf::io::ArrayInputStream input_stream(str.data(), str.size());
   ::google::protobuf::io::CodedInputStream coded_stream(&input_stream);
-  // Set PlanDef message size limit to 1G.
-  coded_stream.SetTotalBytesLimit(1024LL << 20, 512LL << 20);
+  // Set PlanDef message size limit to 2G.
+  coded_stream.SetTotalBytesLimit(2147483647, 512LL << 20);
   return proto->ParseFromCodedStream(&coded_stream);
 }
 
@@ -158,10 +118,10 @@ bool ReadProtoFromBinaryFile(const char* filename, MessageLite* proto) {
   ::google::protobuf::io::CopyingInputStreamAdaptor stream(
       new IfstreamInputStream(filename));
   stream.SetOwnsCopyingStream(true);
-  // Total bytes hard limit / warning limit are set to 1GB and 512MB
+  // Total bytes hard limit / warning limit are set to 2GB and 512MB
   // respectively.
   ::google::protobuf::io::CodedInputStream coded_stream(&stream);
-  coded_stream.SetTotalBytesLimit(1024LL << 20, 512LL << 20);
+  coded_stream.SetTotalBytesLimit(2147483647, 512LL << 20);
   return proto->ParseFromCodedStream(&coded_stream);
 }
 
@@ -196,8 +156,8 @@ string ProtoDebugString(const Message& proto) {
 bool ParseProtoFromLargeString(const string& str, Message* proto) {
   ::google::protobuf::io::ArrayInputStream input_stream(str.data(), str.size());
   ::google::protobuf::io::CodedInputStream coded_stream(&input_stream);
-  // Set PlanDef message size limit to 1G.
-  coded_stream.SetTotalBytesLimit(1024LL << 20, 512LL << 20);
+  // Set PlanDef message size limit to 2G.
+  coded_stream.SetTotalBytesLimit(2147483647, 512LL << 20);
   return proto->ParseFromCodedStream(&coded_stream);
 }
 
@@ -230,7 +190,7 @@ bool ReadProtoFromBinaryFile(const char* filename, MessageLite* proto) {
   std::unique_ptr<CodedInputStream> coded_input(
       new CodedInputStream(raw_input.get()));
   // A hack to manually allow using very large protocol buffers.
-  coded_input->SetTotalBytesLimit(1073741824, 536870912);
+  coded_input->SetTotalBytesLimit(2147483647, 536870912);
   bool success = proto->ParseFromCodedStream(coded_input.get());
   coded_input.reset();
   raw_input.reset();
@@ -415,6 +375,11 @@ CAFFE2_MAKE_SINGULAR_ARGUMENT(string, s)
 #undef CAFFE2_MAKE_SINGULAR_ARGUMENT
 
 template <>
+bool ArgumentHelper::RemoveArgument(OperatorDef& def, int index);
+template <>
+bool ArgumentHelper::RemoveArgument(NetDef& def, int index);
+
+template <>
 Argument MakeArgument(const string& name, const MessageLite& value) {
   Argument arg;
   arg.set_name(name);
@@ -457,31 +422,72 @@ bool HasInput(const OperatorDef& op, const std::string& input) {
   return false;
 }
 
-const Argument& GetArgument(const OperatorDef& def, const string& name) {
-  for (const Argument& arg : def.arg()) {
+// Return the argument index or -1 if it does not exist.
+int GetArgumentIndex(
+    const google::protobuf::RepeatedPtrField<Argument>& args,
+    const string& name) {
+  int index = 0;
+  for (const Argument& arg : args) {
     if (arg.name() == name) {
-      return arg;
+      return index;
     }
+    index++;
   }
-  CAFFE_THROW(
-      "Argument named ",
-      name,
-      " does not exist in operator ",
-      ProtoDebugString(def));
+  return -1;
+}
+
+const Argument& GetArgument(const OperatorDef& def, const string& name) {
+  int index = GetArgumentIndex(def.arg(), name);
+  if (index != -1) {
+    return def.arg(index);
+  } else {
+    CAFFE_THROW(
+        "Argument named ",
+        name,
+        " does not exist in operator ",
+        ProtoDebugString(def));
+  }
+}
+
+const Argument& GetArgument(const NetDef& def, const string& name) {
+  int index = GetArgumentIndex(def.arg(), name);
+  if (index != -1) {
+    return def.arg(index);
+  } else {
+    CAFFE_THROW(
+        "Argument named ",
+        name,
+        " does not exist in net ",
+        ProtoDebugString(def));
+  }
+}
+
+bool GetFlagArgument(
+    const google::protobuf::RepeatedPtrField<Argument>& args,
+    const string& name,
+    bool default_value) {
+  int index = GetArgumentIndex(args, name);
+  if (index != -1) {
+    auto arg = args.Get(index);
+    CAFFE_ENFORCE(
+        arg.has_i(), "Can't parse argument as bool: ", ProtoDebugString(arg));
+    return arg.i();
+  }
+  return default_value;
 }
 
 bool GetFlagArgument(
     const OperatorDef& def,
     const string& name,
-    bool def_value) {
-  for (const Argument& arg : def.arg()) {
-    if (arg.name() == name) {
-      CAFFE_ENFORCE(
-          arg.has_i(), "Can't parse argument as bool: ", ProtoDebugString(arg));
-      return arg.i();
-    }
-  }
-  return def_value;
+    bool default_value) {
+  return GetFlagArgument(def.arg(), name, default_value);
+}
+
+bool GetFlagArgument(
+    const NetDef& def,
+    const string& name,
+    bool default_value) {
+  return GetFlagArgument(def.arg(), name, default_value);
 }
 
 Argument* GetMutableArgument(

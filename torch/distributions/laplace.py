@@ -7,14 +7,13 @@ from torch.distributions.utils import _finfo, broadcast_all
 
 class Laplace(Distribution):
     r"""
-    Creates a Laplace distribution parameterized by `loc` and 'scale'.
+    Creates a Laplace distribution parameterized by :attr:`loc` and :attr:'scale'.
 
     Example::
 
         >>> m = Laplace(torch.tensor([0.0]), torch.tensor([1.0]))
         >>> m.sample()  # Laplace distributed with loc=0, scale=1
-         0.1046
-        [torch.FloatTensor of size 1]
+        tensor([ 0.1046])
 
     Args:
         loc (float or Tensor): mean of the distribution

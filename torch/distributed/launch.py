@@ -85,7 +85,9 @@ Set your device to local rank using either
 
     >>> torch.cuda.set_device(arg.local_rank)  # before your code runs
 
-    or
+or
+
+::
 
     >>> with torch.cuda.device(arg.local_rank):
     >>>    # your code to run
@@ -121,6 +123,7 @@ utility
 """
 
 
+import sys
 import subprocess
 import os
 import socket
@@ -192,7 +195,7 @@ def main():
         current_env["RANK"] = str(dist_rank)
 
         # spawn the processes
-        cmd = ["python",
+        cmd = [sys.executable,
                "-u",
                args.training_script,
                "--local_rank={}".format(local_rank)] + args.training_script_args
