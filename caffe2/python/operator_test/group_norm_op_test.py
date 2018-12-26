@@ -2,16 +2,16 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+from caffe2.python import core
+import caffe2.python.hypothesis_test_util as hu
+import caffe2.python.serialized_test.serialized_test_util as serial
+
+from hypothesis import given
+import hypothesis.strategies as st
 import numpy as np
 
-from caffe2.python import core
-from hypothesis import given
 
-import caffe2.python.hypothesis_test_util as hu
-import hypothesis.strategies as st
-
-
-class TestGroupNormOp(hu.HypothesisTestCase):
+class TestGroupNormOp(serial.SerializedTestCase):
     def group_norm_nchw_ref(self, X, gamma, beta, group, epsilon):
         dims = X.shape
         N = dims[0]
@@ -40,10 +40,11 @@ class TestGroupNormOp(hu.HypothesisTestCase):
         Y = gamma * (X - mu) / std + beta
         return [Y.reshape(dims), mu.reshape(N, G), (1.0 / std).reshape(N, G)]
 
-    @given(N=st.integers(1, 5), G=st.integers(1, 3), D=st.integers(1, 3),
-           H=st.integers(2, 5), W=st.integers(2, 5),
-           epsilon=st.floats(min_value=1e-5, max_value=1e-4),
-           order=st.sampled_from(["NCHW", "NHWC"]), **hu.gcs)
+    @serial.given(
+        N=st.integers(1, 5), G=st.integers(1, 5), D=st.integers(1, 5),
+        H=st.integers(2, 5), W=st.integers(2, 5),
+        epsilon=st.floats(min_value=1e-5, max_value=1e-4),
+        order=st.sampled_from(["NCHW", "NHWC"]), **hu.gcs)
     def test_group_norm_2d(
             self, N, G, D, H, W, epsilon, order, gc, dc):
         op = core.CreateOperator(
@@ -60,8 +61,8 @@ class TestGroupNormOp(hu.HypothesisTestCase):
             X = np.random.randn(N, C, H, W).astype(np.float32) + 1.0
         else:
             X = np.random.randn(N, H, W, C).astype(np.float32) + 1.0
-        gamma = np.random.rand(C).astype(np.float32) - 0.5
-        beta = np.random.rand(C).astype(np.float32) - 0.5
+        gamma = np.random.randn(C).astype(np.float32)
+        beta = np.random.randn(C).astype(np.float32)
         inputs = [X, gamma, beta]
 
         def ref_op(X, gamma, beta):
@@ -74,14 +75,12 @@ class TestGroupNormOp(hu.HypothesisTestCase):
             op=op,
             inputs=inputs,
             reference=ref_op,
-            threshold=5e-4,
+            threshold=5e-3,
         )
         self.assertDeviceChecks(dc, op, inputs, [0, 1, 2])
-        for i in range(len(inputs)):
-            self.assertGradientChecks(gc, op, inputs, i, [0])
 
-    @given(N=st.integers(1, 5), G=st.integers(1, 3), D=st.integers(1, 3),
-           T=st.integers(1, 3), H=st.integers(2, 5), W=st.integers(2, 5),
+    @given(N=st.integers(1, 5), G=st.integers(1, 3), D=st.integers(2, 3),
+           T=st.integers(2, 4), H=st.integers(2, 4), W=st.integers(2, 4),
            epsilon=st.floats(min_value=1e-5, max_value=1e-4),
            order=st.sampled_from(["NCHW", "NHWC"]), **hu.gcs)
     def test_group_norm_3d(
@@ -100,8 +99,8 @@ class TestGroupNormOp(hu.HypothesisTestCase):
             X = np.random.randn(N, C, T, H, W).astype(np.float32) + 1.0
         else:
             X = np.random.randn(N, T, H, W, C).astype(np.float32) + 1.0
-        gamma = np.random.rand(C).astype(np.float32) - 0.5
-        beta = np.random.rand(C).astype(np.float32) - 0.5
+        gamma = np.random.randn(C).astype(np.float32)
+        beta = np.random.randn(C).astype(np.float32)
         inputs = [X, gamma, beta]
 
         def ref_op(X, gamma, beta):
@@ -114,8 +113,34 @@ class TestGroupNormOp(hu.HypothesisTestCase):
             op=op,
             inputs=inputs,
             reference=ref_op,
-            threshold=5e-4,
+            threshold=5e-3,
         )
         self.assertDeviceChecks(dc, op, inputs, [0, 1, 2])
+
+    @given(N=st.integers(1, 5), G=st.integers(1, 5), D=st.integers(2, 2),
+           H=st.integers(2, 5), W=st.integers(2, 5),
+           epsilon=st.floats(min_value=1e-5, max_value=1e-4),
+           order=st.sampled_from(["NCHW", "NHWC"]), **hu.gcs)
+    def test_group_norm_grad(
+            self, N, G, D, H, W, epsilon, order, gc, dc):
+        op = core.CreateOperator(
+            "GroupNorm",
+            ["X", "gamma", "beta"],
+            ["Y", "mean", "inv_std"],
+            group=G,
+            epsilon=epsilon,
+            order=order,
+        )
+
+        C = G * D
+        X = np.arange(N * C * H * W).astype(np.float32)
+        np.random.shuffle(X)
+        if order == "NCHW":
+            X = X.reshape((N, C, H, W))
+        else:
+            X = X.reshape((N, H, W, C))
+        gamma = np.random.randn(C).astype(np.float32)
+        beta = np.random.randn(C).astype(np.float32)
+        inputs = [X, gamma, beta]
         for i in range(len(inputs)):
             self.assertGradientChecks(gc, op, inputs, i, [0])

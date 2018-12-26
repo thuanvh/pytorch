@@ -1,4 +1,4 @@
-#include "ATen/CPUGenerator.h"
+#include <ATen/CPUGenerator.h>
 
 #define const_generator_cast(generator) \
   dynamic_cast<const CPUGenerator&>(generator)
@@ -35,6 +35,11 @@ uint64_t CPUGenerator::initialSeed() {
 CPUGenerator& CPUGenerator::manualSeed(uint64_t seed) {
   THRandom_manualSeed(generator, seed);
   return *this;
+}
+
+CPUGenerator& CPUGenerator::manualSeedAll(uint64_t seed) {
+  // There's only one CPU generator
+  return manualSeed(seed);
 }
 
 void * CPUGenerator::unsafeGetTH() {

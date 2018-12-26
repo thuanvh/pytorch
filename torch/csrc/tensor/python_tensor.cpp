@@ -1,39 +1,55 @@
-#include "python_tensor.h"
+#include <torch/csrc/tensor/python_tensor.h>
 
 #include <structmember.h>
 #include <pybind11/pybind11.h>
 
-#include "torch/csrc/torch.h"
-#include "torch/csrc/assertions.h"
-#include "torch/csrc/Dtype.h"
-#include "torch/csrc/DynamicTypes.h"
-#include "torch/csrc/Exceptions.h"
-#include "torch/csrc/Layout.h"
-#include "torch/csrc/autograd/variable.h"
-#include "torch/csrc/autograd/python_variable.h"
-#include "torch/csrc/autograd/generated/VariableType.h"
-#include "torch/csrc/autograd/utils/wrap_outputs.h"
-#include "torch/csrc/utils/cuda_enabled.h"
-#include "torch/csrc/utils/cuda_lazy_init.h"
-#include "torch/csrc/utils/python_strings.h"
-#include "torch/csrc/utils/tensor_new.h"
-#include "torch/csrc/utils/tensor_types.h"
+#include <torch/csrc/Dtype.h>
+#include <torch/csrc/DynamicTypes.h>
+#include <torch/csrc/Exceptions.h>
+#include <torch/csrc/Layout.h>
+#include <torch/csrc/autograd/variable.h>
+#include <torch/csrc/autograd/python_variable.h>
+#include <torch/csrc/autograd/generated/VariableType.h>
+#include <torch/csrc/autograd/utils/wrap_outputs.h>
+#include <torch/csrc/utils/cuda_enabled.h>
+#include <torch/csrc/utils/cuda_lazy_init.h>
+#include <torch/csrc/utils/python_strings.h>
+#include <torch/csrc/utils/tensor_new.h>
+#include <torch/csrc/utils/tensor_types.h>
+
+#include <ATen/ATen.h>
 
 #include <sstream>
+#include <string>
+#include <type_traits>
 #include <vector>
 
-namespace torch { namespace tensor {
+namespace torch { namespace tensors {
 
 using namespace at;
 using namespace torch::autograd;
 
 struct PyTensorType {
   PyTypeObject py_type;
-  at::Type* aten_type;
+  at::Type* aten_type_;
   THPDtype* dtype;
   THPLayout* layout;
   bool is_cuda;
   char name[64];
+  int backend;
+  int scalar_type;
+
+  // Precondition: Access to this struct is protected by the GIL
+  at::Type* aten_type() {
+    if (!aten_type_) {
+      if (is_cuda) {
+        torch::utils::cuda_lazy_init();
+      }
+      auto* baseType = globalContext().getNonVariableTypeOpt(static_cast<at::Backend>(backend), static_cast<at::ScalarType>(scalar_type));
+      aten_type_ = baseType ? torch::autograd::VariableType::getVariableTypeFromBaseType(*baseType) : nullptr;
+    }
+    return aten_type_;
+  }
 };
 
 static_assert(std::is_standard_layout<PyTensorType>::value, "PyTensorType must be standard layout");
@@ -51,13 +67,11 @@ static TypeError unavailable_type(const PyTensorType& type) {
 static PyObject* Tensor_new(PyTypeObject *type, PyObject *args, PyObject *kwargs) {
   HANDLE_TH_ERRORS
   auto& tensor_type = *((PyTensorType*)type);
-  if (!tensor_type.aten_type) {
+  auto aten_type = tensor_type.aten_type();
+  if (!aten_type) {
     throw unavailable_type(tensor_type);
   }
-  if (tensor_type.aten_type->is_cuda()) {
-    torch::utils::cuda_lazy_init();
-  }
-  return THPVariable_Wrap(torch::utils::legacy_tensor_ctor(*tensor_type.aten_type, args, kwargs));
+  return THPVariable_Wrap(torch::utils::legacy_tensor_ctor(*aten_type, args, kwargs));
   END_HANDLE_TH_ERRORS
 }
 
@@ -65,7 +79,13 @@ static PyObject* Tensor_instancecheck(PyTensorType* self, PyObject* arg) {
   HANDLE_TH_ERRORS
   if (THPVariable_Check(arg)) {
     auto& var = ((THPVariable*)arg)->cdata;
-    if (&var.type() == self->aten_type) {
+    // NB: This is a little unfortunate, in that if I do an isinstance check
+    // against torch.cuda.FloatTensor, this will immediately initialize CUDA.
+    // I originally thought that it would not be possible for aten_type_ to
+    // be nullptr if you had a tensor of some type, in which case you can
+    // skip initializign aten_type(), but TestAutograd.test_type_conversions
+    // seems to violate this property (for whatever reason.)
+    if (&var.type() == self->aten_type()) {
       Py_RETURN_TRUE;
     }
   }
@@ -90,16 +110,16 @@ PyObject *Tensor_is_cuda(PyTensorType* self) {
 }
 
 PyObject *Tensor_is_sparse(PyTensorType *self) {
-  if (!self->layout->is_strided) {
-    Py_RETURN_TRUE;
-  } else {
+  if (self->layout->layout == at::Layout::Strided) {
     Py_RETURN_FALSE;
+  } else {
+    Py_RETURN_TRUE;
   }
 }
 
 static struct PyMethodDef metaclass_methods[] = {
-  {"__instancecheck__", (PyCFunction)Tensor_instancecheck, METH_O, NULL},
-  {NULL}
+  {"__instancecheck__", (PyCFunction)Tensor_instancecheck, METH_O, nullptr},
+  {nullptr}
 };
 
 typedef PyObject *(*getter)(PyObject *, void *);
@@ -130,7 +150,7 @@ static void py_initialize_metaclass(PyTypeObject& metaclass) {
 static void py_initialize_tensor_type(PyTypeObject& type, const char* name, PyObject* tp_dict) {
   // NOTE: we don't use the typical static declaration of PyTypeObject because
   // we need to initialize as many types as there are VariableType instances.
-  // The typical PyVarObject_HEAD_INIT(NULL, 0) is described in the Python
+  // The typical PyVarObject_HEAD_INIT(nullptr, 0) is described in the Python
   // documentation: it initializes the refcnt to 1 and the other object header
   // fields to zero.
   memset(&type, 0, sizeof(PyTypeObject));
@@ -150,17 +170,17 @@ static void py_initialize_tensor_type(PyTypeObject& type, const char* name, PyOb
 
 static const char* get_module(Backend backend) {
   switch (backend) {
-    case kCPU: return "torch";
-    case kCUDA: return "torch.cuda";
-    case kSparseCPU: return "torch.sparse";
-    case kSparseCUDA: return "torch.cuda.sparse";
+    case Backend::CPU: return "torch";
+    case Backend::CUDA: return "torch.cuda";
+    case Backend::SparseCPU: return "torch.sparse";
+    case Backend::SparseCUDA: return "torch.cuda.sparse";
     default: AT_ERROR("invalid backend: ", toString(backend));
   }
 }
 
 static std::string get_name(Backend backend, ScalarType scalarType) {
   std::ostringstream ss;
-  ss << get_module(backend) << "." << at::toString(scalarType) << "Tensor";
+  ss << get_module(backend) << "." << toString(scalarType) << "Tensor";
   return ss.str();
 }
 
@@ -169,7 +189,7 @@ static THPObjectPtr get_storage_obj(const Type& type) {
   auto module_obj = THPObjectPtr(PyImport_ImportModule(module_name));
   if (!module_obj) throw python_error();
 
-  auto storage_name = std::string(at::toString(type.scalarType())) + "Storage";
+  auto storage_name = std::string(toString(type.scalarType())) + "Storage";
   THPObjectPtr storage(PyObject_GetAttrString(module_obj.get(), storage_name.c_str()));
   if (!storage.get()) {
     throw TypeError("couldn't find storage object %s", storage_name.c_str());
@@ -178,8 +198,10 @@ static THPObjectPtr get_storage_obj(const Type& type) {
 }
 
 static void set_type(PyTensorType& type_obj, Backend backend, ScalarType scalarType) {
-  auto baseType = globalContext().type_registry[static_cast<int>(backend)][static_cast<int>(scalarType)].get();
-  type_obj.aten_type = baseType ? torch::autograd::VariableType::getType(*baseType) : nullptr;
+  // This field is lazily initialized from backend and scalar_type
+  type_obj.aten_type_ = nullptr;
+  type_obj.backend = static_cast<int>(backend);
+  type_obj.scalar_type = static_cast<int>(scalarType);
   type_obj.layout = torch::getLayout(backend);
   type_obj.dtype = torch::getDtype(scalarType);
   type_obj.is_cuda = (backend == at::Backend::CUDA || backend == at::Backend::SparseCUDA);
@@ -199,7 +221,7 @@ static THPObjectPtr get_tensor_dict() {
   if (!tensor_class) throw python_error();
 
   auto tensor_type = (PyTypeObject*)tensor_class.get();
-  TORCH_ASSERTM(tensor_type->tp_base, "missing base type for Tensor");
+  AT_CHECK(tensor_type->tp_base, "missing base type for Tensor");
 
   auto res = THPObjectPtr(PyDict_New());
   if (!res) throw python_error();
@@ -256,7 +278,7 @@ void initialize_python_bindings() {
   py_bind_tensor_types(tensor_types);
 
   // Use torch.float32 as the default tensor type
-  set_default_tensor_type(torch::CPU(kFloat));
+  set_default_tensor_type(at::globalContext().getVariableType(at::Backend::CPU, at::kFloat));
 }
 
 static void py_bind_tensor_types(const std::vector<PyTensorType>& tensor_types) {
@@ -268,7 +290,7 @@ static void py_bind_tensor_types(const std::vector<PyTensorType>& tensor_types) 
 
   for (auto& tensor_type : tensor_types) {
     auto name = std::string(tensor_type.name);
-    auto idx = name.rfind(".");
+    auto idx = name.rfind('.');
     auto type_name = name.substr(idx + 1);
     auto module_name = name.substr(0, idx);
 
@@ -312,10 +334,11 @@ void py_set_default_tensor_type(PyObject* obj) {
   } else {
     throw TypeError("invalid type object");
   }
-  if (!type->aten_type) {
+  auto aten_type = type->aten_type();
+  if (!aten_type) {
     throw unavailable_type(*type);
   }
-  set_default_tensor_type(*type->aten_type);
+  set_default_tensor_type(*aten_type);
 }
 
 void py_set_default_dtype(PyObject* obj) {
@@ -323,21 +346,22 @@ void py_set_default_dtype(PyObject* obj) {
   if (THPDtype_Check(obj)) {
     auto &current_default = get_default_tensor_type();
     type = &get_tensor_type((THPDtype*)obj, torch::getLayout(current_default.backend()),
-                            torch::getDeviceType(current_default) == DeviceType::CUDA);
+                            torch::getDeviceType(current_default) == at::Device::Type::CUDA);
   } else {
     throw TypeError("invalid type object");
   }
-  if (!type->aten_type) {
+  auto aten_type = type->aten_type();
+  if (!aten_type) {
     throw unavailable_type(*type);
   }
-  set_default_tensor_type(*type->aten_type);
+  set_default_tensor_type(*aten_type);
 }
 
 void set_default_tensor_type(const at::Type& type) {
   if (!at::isFloatingType(type.scalarType())) {
     throw TypeError("only floating-point types are supported as the default type");
   }
-  if (!type.is_variable_or_undefined()) {
+  if (!type.is_variable() && !type.is_undefined()) {
     throw TypeError("only variable types are supported");
   }
   if (type.is_sparse()) {
@@ -346,7 +370,9 @@ void set_default_tensor_type(const at::Type& type) {
 
   // get the storage first, so if it doesn't exist we don't change the default tensor type
   THPObjectPtr storage = get_storage_obj(type);
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
   default_tensor_type = const_cast<Type*>(&type);
+  at::set_default_dtype(default_tensor_type->typeMeta());
 
   auto torch_module = THPObjectPtr(PyImport_ImportModule("torch"));
   if (!torch_module) throw python_error();
@@ -358,8 +384,14 @@ void set_default_tensor_type(const at::Type& type) {
 }
 
 at::Type& get_default_tensor_type() {
-  TORCH_ASSERT(default_tensor_type);
+  AT_ASSERT(default_tensor_type);
   return *default_tensor_type;
 }
 
-}} // namespace torch::tensor
+Device getDevice(const at::Tensor& tensor) {
+  if (tensor.is_cuda()) {
+    return at::Device(at::DeviceType::CUDA, tensor.get_device());
+  }
+  return at::Device(at::DeviceType::CPU);
+}
+}} // namespace torch::tensors

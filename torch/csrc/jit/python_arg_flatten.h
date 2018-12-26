@@ -1,8 +1,8 @@
 #pragma once
 
-#include "torch/csrc/jit/pybind.h"
-#include "torch/csrc/autograd/variable.h"
-#include "torch/csrc/utils/hash.h"
+#include <torch/csrc/jit/pybind.h>
+#include <torch/csrc/autograd/variable.h>
+#include <torch/csrc/utils/hash.h>
 
 #include <ATen/ATen.h>
 #include <tuple>
@@ -14,9 +14,9 @@ namespace torch { namespace jit { namespace python {
 struct IODescriptor {
   struct VariableMetadata {
     VariableMetadata(const autograd::Variable& var)
-      : sizes(var.sizes())
+      : sizes(var.sizes().vec())
       , type(var.type().scalarType())
-      , device(var.type().is_cuda() ? var.get_device() : -1)
+      , device(var.device())
       , requires_grad(var.requires_grad()) {}
 
     bool operator==(const VariableMetadata& o) const {
@@ -24,13 +24,13 @@ struct IODescriptor {
              std::tie(o.device, o.requires_grad, o.type, o.sizes);
     }
 
-    static std::size_t hash(const VariableMetadata& m) {
+    static size_t hash(const VariableMetadata& m) {
       return get_hash(m.sizes, m.device, m.requires_grad, m.type);
     }
 
     std::vector<int64_t> sizes;
     at::ScalarType type;
-    int device;
+    at::Device device;
     bool requires_grad;
   };
 
@@ -39,7 +39,7 @@ struct IODescriptor {
            std::tie(o.structure, o.metadata, o.grad_enabled);
   }
 
-  static std::size_t hash(const IODescriptor& o) {
+  static size_t hash(const IODescriptor& o) {
     return get_hash(o.structure, o.metadata, o.grad_enabled);
   }
 
@@ -58,14 +58,15 @@ struct IODescriptor {
   // different than the number of 'v's in structure.
   std::string structure;
   std::vector<VariableMetadata> metadata;
-  bool grad_enabled;
+  bool grad_enabled = false;
 };
 
 static inline std::ostream& operator<<(std::ostream& out, const IODescriptor::VariableMetadata& meta) {
-  auto & t = at::getType(meta.device < 0 ? at::kCPU : at::kCUDA, meta.type);
+  at::Device meta_device = meta.device;
+  auto & t = at::getNonVariableType(meta_device.is_cpu() ? at::Backend::CPU : at::Backend::CUDA, meta.type);
   out << t << "(requires_grad=" << meta.requires_grad;
-  if (meta.device > 0) {
-    out << ", device=" << meta.device;
+  if (meta_device.is_cuda()) {
+    out << ", device=" << meta_device.index();
   }
   out << ") {";
   for(size_t i = 0; i < meta.sizes.size(); ++i) {
@@ -104,7 +105,7 @@ struct ParsedArgs {
 
 
 ParsedArgs flatten(py::handle obj);
-PyObject* unflatten(at::ArrayRef<autograd::Variable> outputs,
+PyObject* unflatten(at::ArrayRef<autograd::Variable> vars,
                     const IODescriptor& structure);
 
 }}} // namespace torch::jit::python

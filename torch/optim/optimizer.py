@@ -1,10 +1,17 @@
-from collections import defaultdict, Iterable
+from collections import defaultdict
+from torch._six import container_abcs
 
 import torch
 from copy import deepcopy
 from itertools import chain
 
-required = object()
+
+class _RequiredParameter(object):
+    """Singleton class representing a required parameter for an Optimizer."""
+    def __repr__(self):
+        return "<required parameter>"
+
+required = _RequiredParameter()
 
 
 class Optimizer(object):
@@ -123,7 +130,7 @@ class Optimizer(object):
                 return value
             elif isinstance(value, dict):
                 return {k: cast(param, v) for k, v in value.items()}
-            elif isinstance(value, Iterable):
+            elif isinstance(value, container_abcs.Iterable):
                 return type(value)(cast(param, v) for v in value)
             else:
                 return value
@@ -189,8 +196,6 @@ class Optimizer(object):
             if not isinstance(param, torch.Tensor):
                 raise TypeError("optimizer can only optimize Tensors, "
                                 "but one of the params is " + torch.typename(param))
-            if not param.requires_grad:
-                raise ValueError("optimizing a parameter that doesn't require gradients")
             if not param.is_leaf:
                 raise ValueError("can't optimize a non-leaf Tensor")
 

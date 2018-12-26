@@ -1,15 +1,17 @@
 #pragma once
-#include "ATen/Config.h"
+#include <ATen/Config.h>
+#include <ATen/core/Half.h>
 
 // Defines the accumulation type for a scalar type.
 // Example:
 //   using accscalar_t = acc_type<scalar_t, true>;
 
-#if AT_CUDA_ENABLED()
-#ifdef __CUDACC__
+#if defined(__CUDACC__)
 #include <cuda.h>
 #include <cuda_fp16.h>
-#endif
+#elif defined(__HIPCC__)
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #endif
 
 namespace at {
@@ -17,11 +19,10 @@ namespace at {
 template <typename T, bool is_cuda>
 struct AccumulateType { };
 
-#if AT_CUDA_ENABLED()
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 template <> struct AccumulateType<half, true> { using type = float; };
 #endif
-#endif
+template <> struct AccumulateType<Half, true> { using type = float; };
 template <> struct AccumulateType<float, true> { using type = float; };
 template <> struct AccumulateType<double, true> { using type = double; };
 template <> struct AccumulateType<int8_t, true> { using type = int64_t; };
