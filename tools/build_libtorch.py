@@ -4,25 +4,27 @@ import shlex
 import subprocess
 import sys
 
-from setup_helpers.cuda import USE_CUDA
+# If you want to modify flags or environmental variables that is set when
+# building torch, you should do it in tools/setup_helpers/configure.py.
+# Please don't add it here unless it's only used in LibTorch.
+from setup_helpers.configure import get_libtorch_env_with_flags
 
 if __name__ == '__main__':
     # Placeholder for future interface. For now just gives a nice -h.
     parser = argparse.ArgumentParser(description='Build libtorch')
-    args = parser.parse_args()
-
-    os.environ['BUILD_TORCH'] = 'ON'
-    os.environ['ONNX_NAMESPACE'] = 'onnx_torch'
-    os.environ['PYTORCH_PYTHON'] = sys.executable
+    options = parser.parse_args()
 
     tools_path = os.path.dirname(os.path.abspath(__file__))
-    build_pytorch_libs = os.path.join(tools_path, 'build_pytorch_libs.sh')
+    if sys.platform == 'win32':
+        build_pytorch_libs = os.path.join(tools_path, 'build_pytorch_libs.bat')
+    else:
+        build_pytorch_libs = os.path.join(tools_path, 'build_pytorch_libs.sh')
 
-    command = '{} --use-nnpack '.format(build_pytorch_libs)
-    if USE_CUDA:
-        command += '--use-cuda '
-    command += 'caffe2'
+    command = [build_pytorch_libs]
+    my_env, extra_flags = get_libtorch_env_with_flags()
+    command.extend(extra_flags)
+    command.append('caffe2')
 
     sys.stdout.flush()
     sys.stderr.flush()
-    subprocess.check_call(shlex.split(command), universal_newlines=True)
+    subprocess.check_call(command, universal_newlines=True, env=my_env)
